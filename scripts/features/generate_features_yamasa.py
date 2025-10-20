@@ -17,13 +17,13 @@ def main():
     print("="*60)
 
     # 特徴量生成器の初期化
-    generator = FeatureGeneratorWithS3(bucket_name="fiby-yamasa-prediction")
+    generator = FeatureGeneratorWithS3(bucket_name="fiby-yamasa-prediction-2")
 
     # 入力データのパス
     input_key = "output/df_confirmed_order_input_yamasa_fill_zero.parquet"
 
     print(f"\n1. S3からデータを読み込み中...")
-    print(f"   入力ファイル: s3://fiby-yamasa-prediction/{input_key}")
+    print(f"   入力ファイル: s3://fiby-yamasa-prediction-2/{input_key}")
 
     try:
         # データ読み込み

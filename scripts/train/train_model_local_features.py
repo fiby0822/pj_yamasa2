@@ -40,7 +40,7 @@ def main():
 
     # 予測器の初期化
     predictor = TimeSeriesPredictor(
-        bucket_name="fiby-yamasa-prediction",
+        bucket_name="fiby-yamasa-prediction-2",
         model_type="confirmed_order_demand_yamasa"
     )
 

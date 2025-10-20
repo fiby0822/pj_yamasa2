@@ -41,7 +41,7 @@ def main():
 
     # 予測器の初期化
     predictor = TimeSeriesPredictor(
-        bucket_name="fiby-yamasa-prediction",
+        bucket_name="fiby-yamasa-prediction-2",
         model_type="confirmed_order_demand_yamasa"
     )
 
@@ -62,7 +62,7 @@ def main():
 
         s3_client = boto3.client('s3')
         response = s3_client.get_object(
-            Bucket="fiby-yamasa-prediction",
+            Bucket="fiby-yamasa-prediction-2",
             Key=features_key
         )
         df = pd.read_parquet(BytesIO(response['Body'].read()))
@@ -76,7 +76,7 @@ def main():
         input_key = "output/df_confirmed_order_input_yamasa_fill_zero.parquet"
 
         response = s3_client.get_object(
-            Bucket="fiby-yamasa-prediction",
+            Bucket="fiby-yamasa-prediction-2",
             Key=input_key
         )
         df = pd.read_parquet(BytesIO(response['Body'].read()))
@@ -135,7 +135,7 @@ def main():
         }
 
         evaluator = ModelEvaluator(
-            bucket_name="fiby-yamasa-prediction",
+            bucket_name="fiby-yamasa-prediction-2",
             model_type="confirmed_order_demand_yamasa"
         )
 
@@ -158,7 +158,7 @@ def main():
 
         # S3にアップロード
         s3_client.put_object(
-            Bucket="fiby-yamasa-prediction",
+            Bucket="fiby-yamasa-prediction-2",
             Key=evaluation_path,
             Body=json.dumps(evaluation['metrics'], indent=2)
         )

@@ -150,7 +150,7 @@ def main():
             features_key = "output/features/confirmed_order_demand_yamasa_features_latest.parquet"
 
         response = s3_client.get_object(
-            Bucket="fiby-yamasa-prediction",
+            Bucket="fiby-yamasa-prediction-2",
             Key=features_key
         )
         df = pd.read_parquet(BytesIO(response['Body'].read()))
@@ -167,7 +167,7 @@ def main():
             input_key = "output/df_confirmed_order_input_yamasa_fill_zero.parquet"
 
         response = s3_client.get_object(
-            Bucket="fiby-yamasa-prediction",
+            Bucket="fiby-yamasa-prediction-2",
             Key=input_key
         )
         df = pd.read_parquet(BytesIO(response['Body'].read()))
@@ -214,7 +214,7 @@ def main():
 
     # TimeSeriesPredictorのインスタンス化
     predictor = TimeSeriesPredictor(
-        bucket_name="fiby-yamasa-prediction",
+        bucket_name="fiby-yamasa-prediction-2",
         model_type="confirmed_order_demand_yamasa"
     )
 
@@ -243,7 +243,7 @@ def main():
     if model_last is not None:
         print("\n評価指標を計算中...")
         evaluator = ModelEvaluator(
-            bucket_name="fiby-yamasa-prediction",
+            bucket_name="fiby-yamasa-prediction-2",
             model_type="confirmed_order_demand_yamasa"
         )
 

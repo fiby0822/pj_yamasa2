@@ -22,7 +22,7 @@ from modules.features.timeseries_features import add_timeseries_features
 from modules.config.feature_window_config import WINDOW_SIZE_CONFIG
 
 
-def load_input_data(s3_bucket: str = "fiby-yamasa-prediction") -> pd.DataFrame:
+def load_input_data(s3_bucket: str = "fiby-yamasa-prediction-2") -> pd.DataFrame:
     """
     S3から入力データを読み込み
 
@@ -120,7 +120,7 @@ def generate_features_for_usage_type(
 
     # S3に保存
     s3_client = boto3.client('s3')
-    bucket_name = "fiby-yamasa-prediction"
+    bucket_name = "fiby-yamasa-prediction-2"
 
     # タイムスタンプ付きファイル
     s3_key = f"output/features/confirmed_order_demand_yamasa_features_{usage_type}_{timestamp}.parquet"

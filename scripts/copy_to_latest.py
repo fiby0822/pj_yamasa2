@@ -8,7 +8,7 @@ from datetime import datetime
 def copy_to_latest():
     """最新の特徴量ファイルを_latestにコピー"""
     s3 = boto3.client('s3')
-    bucket_name = 'fiby-yamasa-prediction'
+    bucket_name = 'fiby-yamasa-prediction-2'
 
     # コピー元とコピー先
     source_key = 'output/features/confirmed_order_demand_yamasa_features_20251016_020011.parquet'

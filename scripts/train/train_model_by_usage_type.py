@@ -435,7 +435,7 @@ def main():
     対象usage_type: {args.usage_types}
     """)
 
-    s3_handler = S3Handler("fiby-yamasa-prediction")
+    s3_handler = S3Handler("fiby-yamasa-prediction-2")
 
     # 各usage_typeでモデル学習
     results_by_type = {}

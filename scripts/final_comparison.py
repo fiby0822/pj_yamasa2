@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 
 s3_client = boto3.client('s3', region_name='ap-northeast-1')
-BUCKET_NAME = 'fiby-yamasa-prediction'
+BUCKET_NAME = 'fiby-yamasa-prediction-2'
 
 def read_csv_from_s3(path):
     """S3からCSVファイルを読み込み"""

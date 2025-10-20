@@ -24,7 +24,7 @@ from modules.config.feature_window_config import WINDOW_SIZE_CONFIG
 class FeatureGenerator:
     """特徴量生成の統合クラス"""
 
-    def __init__(self, s3_bucket: str = "fiby-yamasa-prediction"):
+    def __init__(self, s3_bucket: str = "fiby-yamasa-prediction-2"):
         self.s3_bucket = s3_bucket
         self.s3_client = boto3.client('s3', region_name='ap-northeast-1')
 

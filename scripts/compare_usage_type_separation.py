@@ -58,7 +58,7 @@ def main():
 
         # 結合済みの予測結果を読み込み（CSVファイル）
         response = s3.get_object(
-            Bucket='fiby-yamasa-prediction',
+            Bucket='fiby-yamasa-prediction-2',
             Key='output/evaluation/confirmed_order_demand_yamasa_predictions_latest.csv'
         )
         df_combined = pd.read_csv(response['Body'])

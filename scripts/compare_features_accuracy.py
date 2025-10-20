@@ -32,7 +32,7 @@ def save_comparison_to_s3(comparison_result: dict, bucket_name: str, key: str):
 
 def compare_accuracy():
     """精度比較と考察"""
-    bucket_name = "fiby-yamasa-prediction"
+    bucket_name = "fiby-yamasa-prediction-2"
 
     # 以前の精度データを探す
     s3_client = boto3.client('s3')

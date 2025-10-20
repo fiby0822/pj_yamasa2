@@ -21,7 +21,7 @@ def load_metrics_from_s3(bucket_name: str, key: str) -> dict:
 
 def compare_metrics():
     """2つのバージョンの精度を比較"""
-    bucket_name = "fiby-yamasa-prediction"
+    bucket_name = "fiby-yamasa-prediction-2"
 
     # メトリクスの読み込み
     metrics_48 = load_metrics_from_s3(bucket_name, "output/evaluation/threshold48_metrics.json")

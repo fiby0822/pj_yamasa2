@@ -24,7 +24,7 @@ def measure_s3_read_time():
     # Parquetファイル読み込み時間
     start_time = time.time()
     response = s3_client.get_object(
-        Bucket="fiby-yamasa-prediction",
+        Bucket="fiby-yamasa-prediction-2",
         Key="output/features/confirmed_order_demand_yamasa_features_latest.parquet"
     )
     data_bytes = response['Body'].read()

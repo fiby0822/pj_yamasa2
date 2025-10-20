@@ -20,7 +20,7 @@ def analyze_test_distribution():
     features_key = "output/features/confirmed_order_demand_yamasa_features_latest.parquet"
 
     response = s3_client.get_object(
-        Bucket="fiby-yamasa-prediction",
+        Bucket="fiby-yamasa-prediction-2",
         Key=features_key
     )
     df = pd.read_parquet(BytesIO(response['Body'].read()))

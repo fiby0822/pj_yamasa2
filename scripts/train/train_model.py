@@ -25,7 +25,7 @@ from modules.evaluation.metrics import ModelEvaluator
 class UnifiedModelTrainer:
     """統合モデル学習クラス"""
 
-    def __init__(self, s3_bucket: str = "fiby-yamasa-prediction"):
+    def __init__(self, s3_bucket: str = "fiby-yamasa-prediction-2"):
         self.s3_bucket = s3_bucket
         self.s3_client = boto3.client('s3', region_name='ap-northeast-1')
 

@@ -20,7 +20,7 @@ def test_filtering():
 
     # 予測器の初期化
     predictor = TimeSeriesPredictor(
-        bucket_name="fiby-yamasa-prediction",
+        bucket_name="fiby-yamasa-prediction-2",
         model_type="confirmed_order_demand_yamasa"
     )
 
@@ -28,7 +28,7 @@ def test_filtering():
     print("\nデータを読み込み中...")
     s3_client = boto3.client('s3')
     response = s3_client.get_object(
-        Bucket="fiby-yamasa-prediction",
+        Bucket="fiby-yamasa-prediction-2",
         Key="output/features/confirmed_order_demand_yamasa_features_latest.parquet"
     )
     df = pd.read_parquet(BytesIO(response['Body'].read()))

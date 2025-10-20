@@ -11,7 +11,7 @@ import boto3
 from pathlib import Path
 
 s3_client = boto3.client('s3', region_name='ap-northeast-1')
-BUCKET_NAME = 'fiby-yamasa-prediction'
+BUCKET_NAME = 'fiby-yamasa-prediction-2'
 
 def download_from_s3(s3_path):
     """S3からファイルをダウンロード"""

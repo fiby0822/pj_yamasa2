@@ -19,7 +19,7 @@ def analyze_coverage():
     # S3からデータ読み込み
     s3_client = boto3.client('s3')
     response = s3_client.get_object(
-        Bucket="fiby-yamasa-prediction",
+        Bucket="fiby-yamasa-prediction-2",
         Key="output/features/confirmed_order_demand_yamasa_features_latest.parquet"
     )
     df = pd.read_parquet(BytesIO(response['Body'].read()))

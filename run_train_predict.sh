@@ -123,7 +123,7 @@ echo ""
 
 # 出力ファイルの場所を表示
 echo "出力ファイル:"
-echo "  - モデル: s3://fiby-yamasa-prediction/output/models/"
-echo "  - 予測結果: s3://fiby-yamasa-prediction/output/predictions/"
-echo "  - 評価結果: s3://fiby-yamasa-prediction/output/evaluation/"
+echo "  - モデル: s3://fiby-yamasa-prediction-2/output/models/"
+echo "  - 予測結果: s3://fiby-yamasa-prediction-2/output/predictions/"
+echo "  - 評価結果: s3://fiby-yamasa-prediction-2/output/evaluation/"
 echo ""

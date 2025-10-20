@@ -33,7 +33,7 @@ def main():
     print("="*60)
 
     # S3ハンドラの初期化
-    s3_handler = S3Handler(bucket_name="fiby-yamasa-prediction")
+    s3_handler = S3Handler(bucket_name="fiby-yamasa-prediction-2")
 
     # パラメータ設定
     input_key = "output/df_confirmed_order_input_yamasa_fill_zero.parquet"
@@ -43,7 +43,7 @@ def main():
     train_end_date = "2024-12-31"
 
     print(f"\n1. データ読み込み中...")
-    print(f"   入力: s3://fiby-yamasa-prediction/{input_key}")
+    print(f"   入力: s3://fiby-yamasa-prediction-2/{input_key}")
 
     try:
         # データ読み込み
@@ -123,12 +123,12 @@ def main():
             # タイムスタンプ付きファイル
             output_key = f"output/features/{model_type}_features_{timestamp}.parquet"
             s3_handler.write_parquet(df_final, output_key)
-            print(f"   保存完了: s3://fiby-yamasa-prediction/{output_key}")
+            print(f"   保存完了: s3://fiby-yamasa-prediction-2/{output_key}")
 
             # 最新版ファイル
             latest_key = f"output/features/{model_type}_features_latest.parquet"
             s3_handler.write_parquet(df_final, latest_key)
-            print(f"   最新版: s3://fiby-yamasa-prediction/{latest_key}")
+            print(f"   最新版: s3://fiby-yamasa-prediction-2/{latest_key}")
 
             # 処理時間
             total_time = (datetime.now() - start_time).total_seconds()

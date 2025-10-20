@@ -12,7 +12,7 @@ from datetime import datetime
 import argparse
 
 s3_client = boto3.client('s3', region_name='ap-northeast-1')
-BUCKET_NAME = 'fiby-yamasa-prediction'
+BUCKET_NAME = 'fiby-yamasa-prediction-2'
 
 def download_csv_from_s3(path):
     """S3からCSVファイルをダウンロード"""

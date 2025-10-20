@@ -21,13 +21,13 @@ def main():
 
     # 予測器の初期化（学習用と読み込み用を分ける）
     train_predictor = TimeSeriesPredictor(
-        bucket_name="fiby-yamasa-prediction",
+        bucket_name="fiby-yamasa-prediction-2",
         model_type="confirmed_order_demand_yamasa"
     )
 
     # データ読み込み用
     predictor = DemandPredictor(
-        bucket_name="fiby-yamasa-prediction",
+        bucket_name="fiby-yamasa-prediction-2",
         model_type="confirmed_order_demand_yamasa"
     )
 
