@@ -1,0 +1,11 @@
+boto3
+python-dotenv
+xgboost
+scikit-learn
+optuna
+scipy
+pandas
+pyarrow
+numpy
+matplotlib
+seaborn
