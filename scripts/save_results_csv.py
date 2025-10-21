@@ -112,15 +112,15 @@ def upload_csv_to_s3():
     files_to_upload = [
         {
             'local_path': '/home/ubuntu/yamasa2/output/confirmed_order_demand_yamasa_predictions_latest.csv',
-            's3_key': 'output/product_level/confirmed_order_demand_yamasa_predictions_latest.csv'
+            's3_key': 'materials_material_key_equal_store_code/output/evaluation/confirmed_order_demand_yamasa_predictions_latest.csv'
         },
         {
             'local_path': '/home/ubuntu/yamasa2/output/confirmed_order_demand_yamasa_material_summary_latest.csv',
-            's3_key': 'output/product_level/confirmed_order_demand_yamasa_material_summary_latest.csv'
+            's3_key': 'materials_material_key_equal_store_code/output/evaluation/confirmed_order_demand_yamasa_material_summary_latest.csv'
         },
         {
             'local_path': '/home/ubuntu/yamasa2/output/confirmed_order_demand_yamasa_feature_importance_latest.csv',
-            's3_key': 'output/product_level/confirmed_order_demand_yamasa_feature_importance_latest.csv'
+            's3_key': 'materials_material_key_equal_store_code/output/evaluation/confirmed_order_demand_yamasa_feature_importance_latest.csv'
         }
     ]
 
@@ -189,9 +189,9 @@ def main():
     print("  /home/ubuntu/yamasa2/output/confirmed_order_demand_yamasa_feature_importance_latest.csv")
 
     print("\nS3 locations:")
-    print("  s3://fiby-yamasa-prediction/output/product_level/confirmed_order_demand_yamasa_predictions_latest.csv")
-    print("  s3://fiby-yamasa-prediction/output/product_level/confirmed_order_demand_yamasa_material_summary_latest.csv")
-    print("  s3://fiby-yamasa-prediction/output/product_level/confirmed_order_demand_yamasa_feature_importance_latest.csv")
+    print("  s3://fiby-yamasa-prediction/materials_material_key_equal_store_code/output/evaluation/confirmed_order_demand_yamasa_predictions_latest.csv")
+    print("  s3://fiby-yamasa-prediction/materials_material_key_equal_store_code/output/evaluation/confirmed_order_demand_yamasa_material_summary_latest.csv")
+    print("  s3://fiby-yamasa-prediction/materials_material_key_equal_store_code/output/evaluation/confirmed_order_demand_yamasa_feature_importance_latest.csv")
 
 if __name__ == "__main__":
     main()
