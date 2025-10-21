@@ -1,0 +1,16 @@
+A049750の2025年3月実績上昇を事前に捉えられている理由について調査した結果を以下にまとめます。
+
+1. 逐次推論の入力は2024年12月末までの実績に限定
+   - `train_model_product_level.py:219-281` の `sequential_forecast` では、学習カットオフ日 (`train_cutoff_date`) 以下の実績 (`history_rows`) のみを `FeatureState` に投入し、その後は予測値を `state.add_observation(..., is_actual=False)` で更新しています。したがって、2025年1月以降の真値が特徴量に流入する経路は確認されませんでした。
+
+2. 季節性プロファイルが静的特徴量として学習側に渡されている
+   - 特徴量生成側では `generate_features_product_level.py:774-817` の `generate_training_features` が `train_end_date` 以下のデータのみから学習行を作成します。その際、`prepare_static_info`（`work/script/generate_features_product_level.py:646-765`）が月別・週別・曜日別の平均値／分散を算出し、`seasonal_month_mean_f` や `seasonal_week_mean_f` といった静的特徴量を構築します。
+   - これらの静的プロファイルは `FeatureState.build_feature_row`（`work/script/generate_features_product_level.py:552-567`）の季節要因ブロックで参照され、予測時にも同一のマップが渡されます。結果として「3月は平均需要が高い」という学習期の知識が予測時に利用されます。
+
+3. 過去データ上も3月の需要は突出している
+   - `work/data/prepared/df_confirmed_order_input_yamasa_fill_zero.parquet` を確認したところ、A049750 の月次合計は 2024年3月=5,844、4月=5,713、5月=6,641 と明確な繁忙期が存在します。学習範囲（2024年12月以前）にも同様のピークが含まれるため、静的特徴量とラグ／ローリング特徴量の双方が「春先は急伸する」パターンを表現できていると考えられます。
+
+4. 予測が上振れし過ぎないためのガードも存在
+   - `sequential_forecast` 内では `recent_peak_actual_f` を元にしたソフトクリップ（`train_model_product_level.py:257-264`）を掛けており、直近の実績ピークの1.5倍程度に予測値を制限しています。このガードが働くことで、過去ピーク水準＋季節性プロファイルに基づく現実的な上昇に収まっています。
+
+まとめると、3月の需要跳ね上がりを予測できているのは、リークではなく、学習期の過去春季データから構築した季節性特徴量と、逐次予測時にも予測値のみで状態を更新する設計が組み合わさった結果です。静的プロファイルが繁忙期の水準を事前に伝えている点が最大の要因と考えられます。

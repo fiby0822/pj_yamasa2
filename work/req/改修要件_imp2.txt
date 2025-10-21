@@ -30,6 +30,7 @@ imp1で追加した頻度・季節特徴により希少需要SKUは改善した�
 6. 予測総量の安全弁
    - `FeatureState` に `recent_actual_cumsum_28_f`（過去28日の累積実績）と `recent_peak_actual_f` を保持。
    - 推論時、`train_model_product_level.py` で `y_pred` が `recent_peak_actual_f * 1.5` を超えた場合はソフトクリップを適用（tanhベースなど）。閾値は設定ファイル化して検証しやすくする。
+   - 週末（土日）は実績上ほぼゼロであるため、推論出力は無条件で0に落とし込む（例: sequential_forecast内で `if weekday>=5: y_pred=0.0`）。例外扱いが必要なSKUは別途ホワイトリスト化し、必要時に除外できるようにする。
 
 7. モニタリング指標の整備
    - `work/script/tmp` 向けに、`high_frequency_flag_f` や `short_long_mean_gap_f` の分布を出力する集計スクリプトを追加し、imp2導入後の影響を定期的に照査できるようにする。

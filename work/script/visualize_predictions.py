@@ -38,7 +38,9 @@ class PredictionVisualizer:
     ) -> None:
         self.input_file = Path(input_file)
         self.output_dir = Path(output_dir)
-        self.historical_data_file = Path(historical_data_file) if historical_data_file else None
+        self.historical_data_file = (
+            Path(historical_data_file) if historical_data_file else self._detect_default_historical_path()
+        )
         self.horizon_months = horizon_months
         self.history_months = max(history_months, 0)
 
@@ -46,6 +48,33 @@ class PredictionVisualizer:
         self.summary_dir = self.output_dir / "summary"
         self.graph_dir.mkdir(parents=True, exist_ok=True)
         self.summary_dir.mkdir(parents=True, exist_ok=True)
+
+    def _detect_default_historical_path(self) -> Optional[Path]:
+        """既定の履歴データファイルを探索する。"""
+        candidate_dirs = []
+        # 予測ファイルから推測
+        if self.input_file.exists():
+            try:
+                data_dir = self.input_file.parents[1]
+                candidate_dirs.append(data_dir / "prepared")
+            except IndexError:
+                pass
+        # 出力ディレクトリから推測
+        candidate_dirs.append(self.output_dir.parent / "data" / "prepared")
+        candidate_dirs.append(self.output_dir.parent / "prepared")
+
+        candidate_files = [
+            "df_confirmed_order_input_yamasa_fill_zero.parquet",
+            "df_confirmed_order_input_yamasa.parquet",
+        ]
+
+        for directory in candidate_dirs:
+            for filename in candidate_files:
+                candidate_path = directory / filename
+                if candidate_path.exists():
+                    print(f"履歴データファイルを自動検出: {candidate_path}")
+                    return candidate_path
+        return None
 
     # ------------------------------------------------------------------
     # データ読み込み
@@ -264,6 +293,58 @@ class PredictionVisualizer:
         print("グラフ生成中...")
         for product_code in pred_df["material_key"].unique():
             self.create_product_graph(pred_df, product_code, hist_df)
+
+        self.create_simple_error_histogram(pred_df)
+
+    def create_simple_error_histogram(self, pred_df: pd.DataFrame) -> None:
+        """Simple Errorを10%刻みで集計したヒストグラムを生成する。"""
+        if pred_df.empty:
+            print("Simple Errorヒストグラム用のデータが空のため、生成をスキップします。")
+            return
+
+        simple_error = pred_df["simple_error_pct"].dropna()
+        if simple_error.empty:
+            print("Simple Errorに有効な値が存在しないため、ヒストグラム生成をスキップします。")
+            return
+
+        bin_edges = list(range(0, 101, 10))
+        bins = bin_edges + [np.inf]
+        labels = [f"{bin_edges[i]}-{bin_edges[i + 1]}%" for i in range(len(bin_edges) - 1)]
+        labels.append("100%+")
+
+        counts = pd.cut(
+            simple_error,
+            bins=bins,
+            right=False,
+            labels=labels,
+            include_lowest=True,
+        ).value_counts(sort=False)
+
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(range(len(counts)), counts.values, color="#4c72b0", alpha=0.8)
+        plt.xticks(range(len(counts)), counts.index, rotation=45, ha="right")
+        plt.xlabel("Simple Error (%)", fontsize=12)
+        plt.ylabel("Record Count", fontsize=12)
+        plt.title("Simple Error Distribution (10% bins)", fontsize=14)
+        plt.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+
+        for bar, count in zip(bars, counts.values):
+            if count > 0:
+                height = bar.get_height()
+                plt.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    height,
+                    f"{int(count)}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=10,
+                )
+
+        plt.tight_layout()
+        output_path = self.graph_dir / "simple_error_histogram.png"
+        plt.savefig(output_path)
+        plt.close()
+        print(f"  Simple Errorヒストグラムを出力: {output_path}")
 
 
 # --------------------------------------------------------------------------------------
