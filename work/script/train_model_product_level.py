@@ -15,10 +15,14 @@ import json
 import gc
 import warnings
 warnings.filterwarnings('ignore')
-from typing import Optional
+from typing import Dict, Optional
 
 from modules.models.train_predict import TimeSeriesPredictor
 from modules.evaluation.metrics import ModelEvaluator
+
+DEFAULT_OPTUNA_TRIALS = 20
+PREDICTION_CLIP_MULTIPLIER = 3.0
+LOW_VOLUME_THRESHOLD = 5000
 
 
 def apply_leak_safe_predictor_patch():
@@ -78,12 +82,83 @@ def apply_leak_safe_predictor_patch():
     TimeSeriesPredictor._filter_important_material_keys = _filter_no_leak
 
 
+def disable_predictor_s3_save():
+    """S3保存を無効化するダミー関数"""
+
+    def _save_model_to_s3_dummy(self, model, params, save_dir=None):
+        print("S3保存をスキップしました（ローカルモード）")
+        return
+
+    TimeSeriesPredictor._save_model_to_s3 = _save_model_to_s3_dummy
+
+
 class ProductLevelModelTrainer:
     """Product_keyレベルでのモデル学習クラス"""
 
     def __init__(self, base_dir: str = "/home/ubuntu/yamasa2/work/data"):
         self.base_dir = base_dir
         self.prediction_targets: set[str] = set()
+        self.material_baseline = pd.Series(dtype=float)
+        self.volume_segments: Dict[str, str] = {}
+
+    def _clip_predictions(self, df_pred: pd.DataFrame) -> pd.DataFrame:
+        """高すぎる予測値を学習期間平均の一定倍数でクリップする"""
+        if df_pred.empty or 'predicted' not in df_pred.columns:
+            return df_pred
+
+        if self.material_baseline.empty:
+            return df_pred
+
+        df_pred = df_pred.copy()
+        baseline = df_pred['material_key'].map(self.material_baseline)
+        cap = baseline * PREDICTION_CLIP_MULTIPLIER
+
+        # baseline が存在する場合のみクリップ
+        df_pred['predicted'] = np.where(
+            (~baseline.isna()) & (baseline > 0),
+            np.minimum(df_pred['predicted'], cap),
+            df_pred['predicted']
+        )
+
+        df_pred['predicted'] = np.clip(df_pred['predicted'], a_min=0, a_max=None)
+        return df_pred
+
+    def _augment_metrics(self, df_pred: pd.DataFrame, metrics: Dict) -> Dict:
+        """総量とMAPE指標を追加"""
+        metrics = dict(metrics)
+        if df_pred.empty:
+            return metrics
+
+        actual = df_pred['actual']
+        predicted = df_pred['predicted']
+
+        total_actual = actual.sum()
+        total_predicted = predicted.sum()
+        metrics['total_actual'] = float(total_actual)
+        metrics['total_predicted'] = float(total_predicted)
+        metrics['pred_to_actual_ratio'] = float(total_predicted / total_actual) if total_actual > 0 else np.nan
+
+        mask = actual > 0
+        if mask.any():
+            mape = (np.abs(predicted[mask] - actual[mask]) / actual[mask]).mean() * 100
+            metrics['overall_mape_pct'] = float(mape)
+        else:
+            metrics['overall_mape_pct'] = np.nan
+
+        df_pred = df_pred.copy()
+        df_pred['segment'] = df_pred['material_key'].map(self.volume_segments).fillna('low')
+        for segment in df_pred['segment'].unique():
+            seg_df = df_pred[df_pred['segment'] == segment]
+            if seg_df.empty:
+                continue
+            seg_actual = seg_df['actual']
+            seg_pred = seg_df['predicted']
+            seg_total_actual = seg_actual.sum()
+            seg_total_pred = seg_pred.sum()
+            key = f"{segment}_pred_to_actual_ratio"
+            metrics[key] = float(seg_total_pred / seg_total_actual) if seg_total_actual > 0 else np.nan
+
+        return metrics
 
     def load_features(self) -> pd.DataFrame:
         """
@@ -155,6 +230,12 @@ class ProductLevelModelTrainer:
 
         # 予測対象のproduct_keyを記録（学習期間の活動に基づく）
         self.prediction_targets = train_products
+        train_volume = df_train.groupby('material_key')['actual_value'].sum()
+        self.material_baseline = df_train.groupby('material_key')['actual_value'].mean()
+        self.volume_segments = {
+            mk: ('low' if volume < LOW_VOLUME_THRESHOLD else 'high')
+            for mk, volume in train_volume.items()
+        }
 
         return df_filtered
 
@@ -163,8 +244,8 @@ class ProductLevelModelTrainer:
         df: pd.DataFrame,
         train_end_date: str,
         step_count: int,
-        use_optuna: bool = False,
-        n_trials: int = 30
+        use_optuna: bool = True,
+        n_trials: int = DEFAULT_OPTUNA_TRIALS
     ):
         """
         モデル学習と評価
@@ -182,6 +263,7 @@ class ProductLevelModelTrainer:
 
         # TimeSeriesPredictor のフィルタリングをリーク対策版に差し替え
         apply_leak_safe_predictor_patch()
+        disable_predictor_s3_save()
 
         # TimeSeriesPredictorインスタンス作成 (ローカルモード)
         predictor = TimeSeriesPredictor(
@@ -192,6 +274,7 @@ class ProductLevelModelTrainer:
         # 特徴量カラムの特定
         feature_cols = [col for col in df.columns if col.endswith('_f')]
         print(f"特徴量数: {len(feature_cols)}")
+        print(f"Optuna tuning: {use_optuna} (trials={n_trials if use_optuna else 0})")
 
         # 学習・予測実行
         df_train, df_test, df_pred, metrics_dict, model, feature_importance_dict = predictor.train_test_predict_time_split(
@@ -201,7 +284,7 @@ class ProductLevelModelTrainer:
             target_col='actual_value',
             feature_cols=feature_cols,
             use_optuna=use_optuna,
-            n_trials=n_trials,
+            n_trials=n_trials if use_optuna else 0,
             use_gpu=False,
             apply_winsorization=False,
             apply_hampel=False
@@ -227,6 +310,9 @@ class ProductLevelModelTrainer:
         feature_importance = results['feature_importance']
         best_params = results.get('best_params')
 
+        df_train = self._clip_predictions(df_train)
+        metrics = self._augment_metrics(df_train, metrics_dict)
+
         predicted_keys = df_train['material_key'].nunique() if isinstance(df_train, pd.DataFrame) and 'material_key' in df_train.columns else 0
         total_keys = len(self.prediction_targets) if self.prediction_targets else df['material_key'].nunique()
         print(f"\nPredictions generated for {predicted_keys} / {total_keys} material_keys.")
@@ -234,9 +320,6 @@ class ProductLevelModelTrainer:
         # df_testには実際にはメトリクスが入っている
         # metrics_dictに全体のメトリクスが含まれている
         print(f"\n予測対象製品数: {len(self.prediction_targets)}")
-
-        # 評価メトリクスはmetrics_dictに既に含まれている
-        metrics = metrics_dict
 
         print("\n" + "="*60)
         print("Product-level Prediction Metrics")
@@ -357,14 +440,14 @@ def main():
         help='予測月数（デフォルト: 1）'
     )
     parser.add_argument(
-        '--use-optuna',
+        '--disable-optuna',
         action='store_true',
-        help='Optunaでハイパーパラメータ最適化'
+        help='Optunaによるハイパーパラメータ探索を無効化'
     )
     parser.add_argument(
         '--n-trials',
         type=int,
-        default=30,
+        default=DEFAULT_OPTUNA_TRIALS,
         help='Optunaの試行回数'
     )
 
@@ -375,8 +458,9 @@ def main():
     print("="*60)
     print(f"Train end date: {args.train_end_date}")
     print(f"Step count: {args.step_count}")
-    print(f"Use Optuna: {args.use_optuna}")
-    if args.use_optuna:
+    use_optuna = not args.disable_optuna
+    print(f"Use Optuna: {use_optuna}")
+    if use_optuna:
         print(f"N trials: {args.n_trials}")
     print("="*60)
 
@@ -399,7 +483,7 @@ def main():
         df_filtered,
         train_end_date=args.train_end_date,
         step_count=args.step_count,
-        use_optuna=args.use_optuna,
+        use_optuna=use_optuna,
         n_trials=args.n_trials
     )
 
@@ -408,7 +492,10 @@ def main():
     print("="*60)
     print(f"\nFinal Metrics:")
     for metric_name, value in results['metrics'].items():
-        print(f"  {metric_name}: {value:.4f}")
+        if isinstance(value, (int, float)):
+            print(f"  {metric_name}: {value:.4f}")
+        else:
+            print(f"  {metric_name}: {value}")
 
 
 if __name__ == "__main__":

@@ -169,7 +169,7 @@ class ProductFeatureGenerator:
             移動統計特徴量を追加したデータ
         """
         if windows is None:
-            windows = [7, 14, 28]
+            windows = [3, 5, 7, 14, 28]
 
         print(f"\nGenerating rolling features (NO LEAK): {windows}")
 
@@ -244,6 +244,50 @@ class ProductFeatureGenerator:
                             df.loc[test_indices, f'rolling_std_{window}_f'] = test_std
                             df.loc[test_indices, f'rolling_max_{window}_f'] = test_max
                             df.loc[test_indices, f'rolling_min_{window}_f'] = test_min
+
+        return df
+
+    def generate_ewm_features(self, df: pd.DataFrame, spans: List[int] = None) -> pd.DataFrame:
+        """
+        指数移動平均ベースの特徴量を追加（リーク防止）
+
+        Args:
+            df: 入力データ
+            spans: EMAに使用するスパン
+
+        Returns:
+            EMA特徴量を追加したデータ
+        """
+        if spans is None:
+            spans = [7, 14, 30]
+
+        print(f"\nGenerating exponential moving features (NO LEAK): {spans}")
+
+        if 'data_type' not in df.columns:
+            raise ValueError("data_type column must exist. Run split_train_test first.")
+
+        for span in spans:
+            col = f'ewm_mean_{span}_f'
+            df[col] = np.nan
+
+            for material_key in df['material_key'].unique():
+                mask = df['material_key'] == material_key
+                material_df = df[mask].sort_values('file_date')
+
+                train_mask = material_df['data_type'] == 'train'
+                train_idx = material_df[train_mask].index
+
+                if train_mask.any():
+                    train_values = material_df.loc[train_idx, 'actual_value'].astype(float)
+                    ewm_values = train_values.ewm(span=span, adjust=False).mean()
+                    df.loc[train_idx, col] = ewm_values.values
+
+                test_mask = material_df['data_type'] == 'test'
+                test_idx = material_df[test_mask].index
+
+                if test_mask.any() and train_mask.any():
+                    last_value = df.loc[train_idx[-1], col]
+                    df.loc[test_idx, col] = last_value
 
         return df
 
@@ -334,6 +378,69 @@ class ProductFeatureGenerator:
                     # データが不足している場合は0を設定
                     df.loc[test_indices, 'trend_7d_f'] = 0
                     df.loc[test_indices, 'trend_28d_f'] = 0
+
+        return df
+
+    def generate_event_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        祝日・連休等のイベントフラグを生成
+        """
+        print("\nGenerating event features...")
+
+        dates = df['file_date']
+        year_series = dates.dt.year.astype(str)
+
+        # 年初1週の需要低下フラグ
+        new_year_start = pd.to_datetime(year_series + "-01-01")
+        new_year_end = pd.to_datetime(year_series + "-01-07")
+        df['is_new_year_period_f'] = dates.between(new_year_start, new_year_end, inclusive='both').astype(int)
+
+        # 会計期関連
+        df['is_fiscal_year_start_f'] = ((dates.dt.month == 4) & (dates.dt.day <= 7)).astype(int)
+        df['is_fiscal_year_end_f'] = ((dates.dt.month == 3) & (dates.dt.day >= 25)).astype(int)
+
+        # ゴールデンウイーク (4/29-5/5)
+        gw_start = pd.to_datetime(year_series + "-04-29")
+        gw_end = pd.to_datetime(year_series + "-05-05")
+        df['is_golden_week_f'] = dates.between(gw_start, gw_end, inclusive='both').astype(int)
+
+        # 連休明け補正: ゴールデンウイーク明け1週間
+        gw_after_start = gw_end + pd.Timedelta(days=1)
+        gw_after_end = gw_after_start + pd.Timedelta(days=6)
+        df['is_post_golden_week_f'] = dates.between(gw_after_start, gw_after_end, inclusive='both').astype(int)
+
+        # ISO週番号
+        df['iso_weekofyear_f'] = dates.dt.isocalendar().week.astype(int)
+
+        return df
+
+    def generate_recent_baseline_features(self, df: pd.DataFrame, train_end_date: str) -> pd.DataFrame:
+        """
+        学習期間の最終値を基準にしたベースライン差分を算出
+        """
+        print("\nGenerating recent baseline features...")
+
+        cutoff = pd.to_datetime(train_end_date)
+        last_values = (
+            df[df['file_date'] <= cutoff]
+            .sort_values('file_date')
+            .groupby('material_key')['actual_value']
+            .last()
+        )
+
+        df['last_train_actual_f'] = df['material_key'].map(last_values)
+
+        # 直近ベースラインとラグ値の比較
+        df['ratio_lag1_to_last_train_f'] = np.where(
+            (df['last_train_actual_f'] > 0) & (~df['lag_1_f'].isna()),
+            df['lag_1_f'] / df['last_train_actual_f'],
+            np.nan
+        )
+        df['diff_lag1_last_train_f'] = np.where(
+            ~df['lag_1_f'].isna(),
+            df['lag_1_f'] - df['last_train_actual_f'],
+            np.nan
+        )
 
         return df
 
@@ -469,16 +576,25 @@ class ProductFeatureGenerator:
         # 5. 移動統計特徴量
         df = self.generate_rolling_features(df)
 
-        # 6. 商品プロファイル特徴量（学習データのみから統計を計算）
+        # 6. EMA特徴量
+        df = self.generate_ewm_features(df)
+
+        # 7. 商品プロファイル特徴量（学習データのみから統計を計算）
         df = self.generate_product_profile_features(df)
 
-        # 7. トレンド特徴量
+        # 8. トレンド特徴量
         df = self.generate_trend_features(df)
 
-        # 8. 曜日別特徴量（学習データのみから統計を計算）
+        # 9. イベント特徴量
+        df = self.generate_event_features(df)
+
+        # 10. 曜日別特徴量（学習データのみから統計を計算）
         df = self.generate_dow_features(df)
 
-        # 9. 保存
+        # 11. 直近期値ベースライン特徴量
+        df = self.generate_recent_baseline_features(df, train_end_date)
+
+        # 12. 保存
         self.save_features(df)
 
         # サマリー

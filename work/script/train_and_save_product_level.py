@@ -18,6 +18,10 @@ from typing import Optional
 
 from modules.models.train_predict import TimeSeriesPredictor
 
+DEFAULT_OPTUNA_TRIALS = 20
+PREDICTION_CLIP_MULTIPLIER = 3.0
+LOW_VOLUME_THRESHOLD = 5000
+
 
 # S3保存を無効化するためのモンキーパッチ
 def _save_model_to_s3_dummy(self, model, params, save_dir=None):
@@ -88,6 +92,40 @@ class ProductLevelTrainer:
 
     def __init__(self, base_dir: str = "/home/ubuntu/yamasa2/work/data"):
         self.base_dir = base_dir
+        self.material_baseline = pd.Series(dtype=float)
+        self.volume_segments = {}
+
+    def _prepare_volume_metadata(self, df: pd.DataFrame, train_end_date: str) -> None:
+        cutoff = pd.to_datetime(train_end_date)
+        train_df = df[df['file_date'] <= cutoff]
+        if train_df.empty:
+            self.material_baseline = pd.Series(dtype=float)
+            self.volume_segments = {}
+            return
+
+        self.material_baseline = train_df.groupby('material_key')['actual_value'].mean()
+        train_volume = train_df.groupby('material_key')['actual_value'].sum()
+        self.volume_segments = {
+            mk: ('low' if vol < LOW_VOLUME_THRESHOLD else 'high')
+            for mk, vol in train_volume.items()
+        }
+
+    def _clip_predictions(self, df_pred: pd.DataFrame) -> pd.DataFrame:
+        if df_pred.empty or 'predicted' not in df_pred.columns:
+            return df_pred
+        if self.material_baseline.empty:
+            return df_pred
+
+        df_pred = df_pred.copy()
+        baseline = df_pred['material_key'].map(self.material_baseline)
+        cap = baseline * PREDICTION_CLIP_MULTIPLIER
+        df_pred['predicted'] = np.where(
+            (~baseline.isna()) & (baseline > 0),
+            np.minimum(df_pred['predicted'], cap),
+            df_pred['predicted']
+        )
+        df_pred['predicted'] = np.clip(df_pred['predicted'], a_min=0, a_max=None)
+        return df_pred
 
     def load_features(self):
         """特徴量データを読み込み"""
@@ -117,6 +155,9 @@ class ProductLevelTrainer:
         # 特徴量カラムの特定
         feature_cols = [col for col in df.columns if col.endswith('_f')]
         print(f"Number of features: {len(feature_cols)}")
+        print(f"Optuna tuning: True (trials={DEFAULT_OPTUNA_TRIALS})")
+
+        self._prepare_volume_metadata(df, train_end_date)
 
         # 学習・予測実行（S3保存はモンキーパッチで無効化済み）
         df_pred, bykey_df, feature_importance_df, best_params, model, all_metrics = predictor.train_test_predict_time_split(
@@ -125,11 +166,24 @@ class ProductLevelTrainer:
             step_count=step_count,
             target_col='actual_value',
             feature_cols=feature_cols,
-            use_optuna=False,
+            use_optuna=True,
+            n_trials=DEFAULT_OPTUNA_TRIALS,
             use_gpu=False,
             apply_winsorization=False,
             apply_hampel=False
         )
+
+        df_pred = self._clip_predictions(df_pred)
+
+        if not df_pred.empty and {'actual', 'predicted'}.issubset(df_pred.columns):
+            actual_sum = df_pred['actual'].sum()
+            predicted_sum = df_pred['predicted'].sum()
+            ratio = predicted_sum / actual_sum if actual_sum > 0 else np.nan
+            print(f"Aggregate actual: {actual_sum:,.1f}, predicted: {predicted_sum:,.1f}, ratio: {ratio:.2f}")
+            all_metrics = dict(all_metrics)
+            all_metrics['total_actual'] = float(actual_sum)
+            all_metrics['total_predicted'] = float(predicted_sum)
+            all_metrics['pred_to_actual_ratio'] = float(ratio) if ratio == ratio else np.nan
 
         predicted_keys = df_pred['material_key'].nunique() if not df_pred.empty and 'material_key' in df_pred.columns else 0
         total_keys = df['material_key'].nunique() if 'material_key' in df.columns else 0
