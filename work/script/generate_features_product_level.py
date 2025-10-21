@@ -1,641 +1,566 @@
 #!/usr/bin/env python3
 """
-商品レベルの特徴量生成
-material_key = product_key として処理
+商品レベルの特徴量生成（逐次更新対応版）
+
+目的:
+    - 学習データ（train_end_date以前）のみを用いたリークレスな特徴量を生成する
+    - 予測時に逐次的に更新できる特徴量セットを定義・共有する
+    - 特徴量仕様・マッピング情報を JSON として保存し、学習・推論で再利用する
+
+出力:
+    - work/data/features/product_level_features_latest.parquet
+    - work/data/features/product_level_features_YYYYmmdd_HHMMSS.parquet
+    - work/data/features/product_static_info.json
+
+このスクリプトは `FeatureState` クラスを公開し、学習・推論の両方で同一ロジックの
+特徴量を利用できるようにしている。推論側では、このクラスに予測済み需要を連続的に
+投入することで、マルチステップ予測中もラグ/ローリング指標が更新される。
 """
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import gc
+
+from __future__ import annotations
+
+import json
 import os
-from typing import List, Dict, Tuple
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Deque, Dict, Iterable, List, Optional, Tuple
+
 import jpholiday
+import numpy as np
+import pandas as pd
 
-class ProductFeatureGenerator:
-    def __init__(self, base_dir: str = "/home/ubuntu/yamasa2/work/data"):
+
+# --------------------------------------------------------------------------------------
+# 定数定義
+# --------------------------------------------------------------------------------------
+
+DEFAULT_BASE_DIR = "/home/ubuntu/yamasa2/work/data"
+FEATURE_FILENAME_LATEST = "product_level_features_latest.parquet"
+FEATURE_FILENAME_TEMPLATE = "product_level_features_{timestamp}.parquet"
+STATIC_INFO_FILENAME = "product_static_info.json"
+AGGREGATED_INPUT_FILENAME = "df_confirmed_order_input_yamasa_fill_zero.parquet"
+
+MIN_HISTORY = 28
+MAX_HISTORY = 180
+EWM_SPANS = (7, 14, 30)
+ROLLING_WINDOWS = (3, 7, 14, 28)
+STD_WINDOWS = (7, 14, 28)
+NONZERO_WINDOWS = (7, 14)
+TREND_LAGS = (7, 14)
+VOLUME_THRESHOLD = 5000
+
+
+CALENDAR_FEATURES = [
+    "dow",
+    "is_weekend",
+    "is_business_day_f",
+    "month",
+    "quarter",
+    "day_of_month",
+    "iso_week",
+    "is_month_start",
+    "is_month_end",
+]
+
+STATEFUL_FEATURES = [
+    "lag_1_f",
+    "lag_2_f",
+    "lag_3_f",
+    "lag_7_f",
+    "lag_14_f",
+    "lag_28_f",
+    "rolling_mean_3_f",
+    "rolling_mean_7_f",
+    "rolling_mean_14_f",
+    "rolling_mean_28_f",
+    "rolling_std_7_f",
+    "rolling_std_14_f",
+    "rolling_std_28_f",
+    "rolling_min_7_f",
+    "rolling_max_7_f",
+    "ewm_mean_7_f",
+    "ewm_mean_14_f",
+    "ewm_mean_30_f",
+    "recent_nonzero_ratio_7_f",
+    "recent_nonzero_ratio_14_f",
+    "days_since_last_obs_f",
+    "days_since_last_nonzero_f",
+    "gap_business_days_f",
+    "cumulative_mean_f",
+    "cumulative_std_f",
+    "trend_7_ratio_f",
+    "trend_14_ratio_f",
+    "seasonal_month_mean_f",
+    "seasonal_month_std_f",
+]
+
+STATIC_FEATURES = [
+    "material_idx",
+    "product_mean_f",
+    "product_std_f",
+    "product_median_f",
+    "product_min_f",
+    "product_max_f",
+    "volume_segment_f",
+]
+
+FEATURE_COLUMNS: List[str] = STATEFUL_FEATURES + STATIC_FEATURES + CALENDAR_FEATURES
+
+
+# --------------------------------------------------------------------------------------
+# ヘルパー関数
+# --------------------------------------------------------------------------------------
+
+def is_business_day(date: pd.Timestamp) -> int:
+    """営業日判定（土日祝を除外）。"""
+    if pd.isna(date):
+        return 0
+    if date.weekday() >= 5:
+        return 0
+    if jpholiday.is_holiday(date):
+        return 0
+    return 1
+
+
+def count_business_days(start: pd.Timestamp, end: pd.Timestamp) -> int:
+    """
+    2つの日付の間（start, end を除く）に含まれる営業日数をカウントする。
+    """
+    if pd.isna(start) or pd.isna(end) or end <= start:
+        return 0
+    count = 0
+    current = start + timedelta(days=1)
+    while current < end:
+        count += is_business_day(current)
+        current += timedelta(days=1)
+    return count
+
+
+def safe_ratio(numerator: float, denominator: float, default: float = 1.0) -> float:
+    """ゼロ割を避けるための安全な比率計算。"""
+    if denominator is None or np.isnan(denominator) or denominator == 0:
+        return default
+    return float(numerator) / float(denominator)
+
+
+def load_aggregated_data(base_dir: str) -> pd.DataFrame:
+    """事前に集約済みの日次データを読み込む。"""
+    path = os.path.join(base_dir, "prepared", AGGREGATED_INPUT_FILENAME)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Aggregated input not found: {path}")
+    df = pd.read_parquet(path)
+    df["file_date"] = pd.to_datetime(df["file_date"])
+    return df
+
+
+def ensure_directory(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+# --------------------------------------------------------------------------------------
+# 特徴量生成用の状態クラス
+# --------------------------------------------------------------------------------------
+
+@dataclass
+class FeatureState:
+    """
+    逐次的にラグ・ローリング特徴量を更新するための状態クラス。
+
+    推論時は予測値を `add_observation` で投入し続けることで、マルチステップ予測でも
+    最新の状態が反映された特徴量を生成できる。
+    """
+
+    min_history: int = MIN_HISTORY
+    max_history: int = MAX_HISTORY
+    ewm_spans: Tuple[int, ...] = EWM_SPANS
+
+    history_values: Deque[float] = field(default_factory=lambda: deque(maxlen=MAX_HISTORY))
+    history_dates: Deque[pd.Timestamp] = field(default_factory=lambda: deque(maxlen=MAX_HISTORY))
+    last_nonzero_date: Optional[pd.Timestamp] = None
+    ewm_state: Dict[int, Optional[float]] = field(
+        default_factory=lambda: {span: None for span in EWM_SPANS}
+    )
+
+    def add_observation(self, date: pd.Timestamp, value: float) -> None:
+        """最新観測（実績または予測）を状態に追加する。"""
+        if pd.isna(date):
+            return
+        value = float(value)
+        self.history_values.append(value)
+        self.history_dates.append(date)
+        if value > 0:
+            self.last_nonzero_date = date
+
+        for span in self.ewm_spans:
+            prev = self.ewm_state.get(span)
+            if prev is None or np.isnan(prev):
+                self.ewm_state[span] = value
+            else:
+                alpha = 2.0 / (span + 1.0)
+                self.ewm_state[span] = alpha * value + (1 - alpha) * prev
+
+    # ----------------------------------------------------------------------------------
+
+    def _history_list(self) -> List[float]:
+        return list(self.history_values)
+
+    def _require_history(self) -> bool:
+        return len(self.history_values) >= self.min_history
+
+    def _calendar_features(self, date: pd.Timestamp) -> Dict[str, float]:
+        weekday = date.weekday()
+        return {
+            "dow": float(weekday),
+            "is_weekend": float(weekday >= 5),
+            "is_business_day_f": float(is_business_day(date)),
+            "month": float(date.month),
+            "quarter": float(date.quarter),
+            "day_of_month": float(date.day),
+            "iso_week": float(date.isocalendar().week),
+            "is_month_start": float(date.day <= 7),
+            "is_month_end": float(date.day >= 24),
+        }
+
+    def build_feature_row(
+        self,
+        current_date: pd.Timestamp,
+        static_info: Dict[str, float],
+    ) -> Optional[Dict[str, float]]:
         """
-        初期化
-
-        Args:
-            base_dir: データの基本ディレクトリ
-        """
-        self.base_dir = base_dir
-        print(f"Base directory: {self.base_dir}")
-
-    def load_data(self, filename: str = "df_confirmed_order_input_yamasa_fill_zero.parquet"):
-        """
-        ローカルからデータを読み込み
-        """
-        # work/data/preparedディレクトリから読み込み
-        local_path = os.path.join(self.base_dir, "prepared", filename)
-        if os.path.exists(local_path):
-            print(f"Loading data from local: {local_path}")
-            df = pd.read_parquet(local_path)
-        else:
-            raise FileNotFoundError(f"Data file not found: {local_path}. Please run prepare_product_level_data_local.py first.")
-
-        print(f"Loaded data shape: {df.shape}")
-
-        # 日付型に変換
-        df['file_date'] = pd.to_datetime(df['file_date'])
-
-        return df
-
-    def generate_basic_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        基本的な特徴量を生成
-
-        Args:
-            df: 入力データ
+        現在の状態から特徴量行を生成する。
 
         Returns:
-            特徴量を追加したデータ
+            特徴量辞書（FEATURE_COLUMNSの各キーを含む）もしくは None（履歴不足時）
         """
-        print("\nGenerating basic features...")
-
-        # 曜日特徴量
-        df['dow'] = df['file_date'].dt.dayofweek
-        df['is_weekend'] = (df['dow'] >= 5).astype(int)
-
-        # day_of_week_f: カテゴリカル変数として曜日（1=月曜日、土日はnull）
-        def get_weekday_business(date):
-            """営業日の曜日を取得（1=月曜日、土日はnull）"""
-            if pd.isna(date):
-                return np.nan
-            weekday = date.weekday()  # 0=月曜日
-            if weekday >= 5:  # 土日
-                return np.nan
-            return weekday + 1  # 1=月曜日に変換
-
-        df["day_of_week_f"] = df['file_date'].apply(get_weekday_business).astype("float32")
-
-        # is_business_day_f: 営業日フラグ（拡張祝日判定）
-        def is_business_day(date):
-            """営業日判定（土日祝日以外）"""
-            if pd.isna(date):
-                return np.nan
-            # 土日判定
-            if date.weekday() >= 5:  # 5=土曜, 6=日曜
-                return 0
-            # 祝日判定
-            if jpholiday.is_holiday(date):
-                return 0
-            # 年末年始判定（1/1~1/5と12/30~12/31）
-            if (date.month == 1 and date.day <= 5) or (date.month == 12 and date.day >= 30):
-                return 0
-            return 1
-
-        df['is_business_day_f'] = df['file_date'].apply(is_business_day).astype("int8")
-
-        # 月・四半期特徴量
-        df['month'] = df['file_date'].dt.month
-        df['quarter'] = df['file_date'].dt.quarter
-        df['year'] = df['file_date'].dt.year
-
-        # 月初・月末フラグ
-        df['is_month_start'] = (df['file_date'].dt.day <= 7).astype(int)
-        df['is_month_end'] = (df['file_date'].dt.day >= 24).astype(int)
-
-        print(f"Added basic features: dow, is_weekend, day_of_week_f, is_business_day_f, month, quarter, year, is_month_start, is_month_end")
-
-        return df
-
-    def generate_lag_features(self, df: pd.DataFrame, lags: List[int] = None) -> pd.DataFrame:
-        """
-        ラグ特徴量を生成（データリーク防止版）
-        テストデータには学習期間のデータのみを使用
-
-        Args:
-            df: 入力データ（data_typeカラムが必要）
-            lags: ラグのリスト
-
-        Returns:
-            ラグ特徴量を追加したデータ
-        """
-        if lags is None:
-            lags = [1, 2, 3, 7, 14, 21, 28]
-
-        print(f"\nGenerating lag features (NO LEAK): {lags}")
-
-        # data_typeが存在しない場合はエラー
-        if 'data_type' not in df.columns:
-            raise ValueError("data_type column must exist. Run split_train_test first.")
-
-        # material_key（product_key）でグループ化
-        for lag in lags:
-            print(f"  Creating lag_{lag} (leak-free)...")
-
-            # 新しいカラムを初期化
-            df[f'lag_{lag}_f'] = np.nan
-
-            # 各商品ごとに処理
-            for material_key in df['material_key'].unique():
-                material_mask = df['material_key'] == material_key
-                material_df = df[material_mask].copy()
-                material_df = material_df.sort_values('file_date')
-
-                # 学習データのラグ特徴量（通常のshift）
-                train_mask = (material_df['data_type'] == 'train')
-                if train_mask.any():
-                    train_indices = material_df[train_mask].index
-                    df.loc[train_indices, f'lag_{lag}_f'] = material_df[train_mask]['actual_value'].shift(lag).values
-
-                # テストデータのラグ特徴量（学習期間の最後からのみ取得）
-                test_mask = (material_df['data_type'] == 'test')
-                if test_mask.any() and train_mask.any():
-                    test_indices = material_df[test_mask].index
-                    train_values = material_df[train_mask]['actual_value'].values
-                    test_dates = material_df[test_mask]['file_date'].values
-
-                    # テスト期間の各行について、学習期間の最後からlag分前の値を設定
-                    for i, idx in enumerate(test_indices):
-                        # 学習期間の最後からlag分遡った位置
-                        source_position = len(train_values) - lag + i
-                        if source_position >= 0 and source_position < len(train_values):
-                            df.loc[idx, f'lag_{lag}_f'] = train_values[source_position]
-
-        return df
-
-    def generate_rolling_features(self, df: pd.DataFrame, windows: List[int] = None) -> pd.DataFrame:
-        """
-        移動平均・移動標準偏差特徴量を生成（データリーク防止版）
-        テストデータには学習期間のデータのみを使用
-
-        Args:
-            df: 入力データ（data_typeカラムが必要）
-            windows: ウィンドウサイズのリスト
-
-        Returns:
-            移動統計特徴量を追加したデータ
-        """
-        if windows is None:
-            windows = [3, 5, 7, 14, 28]
-
-        print(f"\nGenerating rolling features (NO LEAK): {windows}")
-
-        # data_typeが存在しない場合はエラー
-        if 'data_type' not in df.columns:
-            raise ValueError("data_type column must exist. Run split_train_test first.")
-
-        for window in windows:
-            print(f"  Creating rolling_{window} features (leak-free)...")
-
-            # 新しいカラムを初期化
-            df[f'rolling_mean_{window}_f'] = np.nan
-            df[f'rolling_std_{window}_f'] = np.nan
-            df[f'rolling_max_{window}_f'] = np.nan
-            df[f'rolling_min_{window}_f'] = np.nan
-
-            # 各商品ごとに処理
-            for material_key in df['material_key'].unique():
-                material_mask = df['material_key'] == material_key
-                material_df = df[material_mask].copy()
-                material_df = material_df.sort_values('file_date')
-
-                # 学習データの移動統計特徴量（通常のrolling）
-                train_mask = (material_df['data_type'] == 'train')
-                if train_mask.any():
-                    train_indices = material_df[train_mask].index
-                    train_values = material_df[train_mask]['actual_value'].values
-
-                    # shift(1)を適用してからrollingを計算
-                    shifted_values = pd.Series(train_values).shift(1)
-                    rolling_mean = shifted_values.rolling(window=window, min_periods=1).mean()
-                    rolling_std = shifted_values.rolling(window=window, min_periods=1).std()
-                    rolling_max = shifted_values.rolling(window=window, min_periods=1).max()
-                    rolling_min = shifted_values.rolling(window=window, min_periods=1).min()
-
-                    df.loc[train_indices, f'rolling_mean_{window}_f'] = rolling_mean.values
-                    df.loc[train_indices, f'rolling_std_{window}_f'] = rolling_std.values
-                    df.loc[train_indices, f'rolling_max_{window}_f'] = rolling_max.values
-                    df.loc[train_indices, f'rolling_min_{window}_f'] = rolling_min.values
-
-                # テストデータの移動統計特徴量（学習期間の最後のwindow分のデータを使用）
-                test_mask = (material_df['data_type'] == 'test')
-                if test_mask.any() and train_mask.any():
-                    test_indices = material_df[test_mask].index
-                    train_values = material_df[train_mask]['actual_value'].values
-
-                    # 学習期間最後のwindow分のデータで統計量を計算
-                    if len(train_values) >= window:
-                        # 学習期間最後のwindow分のデータ
-                        last_window_values = train_values[-window:]
-
-                        # テスト期間のすべての行に同じ値を設定
-                        # (テスト期間内では更新されない）
-                        test_mean = np.mean(last_window_values)
-                        test_std = np.std(last_window_values)
-                        test_max = np.max(last_window_values)
-                        test_min = np.min(last_window_values)
-
-                        df.loc[test_indices, f'rolling_mean_{window}_f'] = test_mean
-                        df.loc[test_indices, f'rolling_std_{window}_f'] = test_std
-                        df.loc[test_indices, f'rolling_max_{window}_f'] = test_max
-                        df.loc[test_indices, f'rolling_min_{window}_f'] = test_min
-                    else:
-                        # ウィンドウサイズに満たない場合は、利用可能なデータで計算
-                        if len(train_values) > 0:
-                            test_mean = np.mean(train_values)
-                            test_std = np.std(train_values) if len(train_values) > 1 else 0
-                            test_max = np.max(train_values)
-                            test_min = np.min(train_values)
-
-                            df.loc[test_indices, f'rolling_mean_{window}_f'] = test_mean
-                            df.loc[test_indices, f'rolling_std_{window}_f'] = test_std
-                            df.loc[test_indices, f'rolling_max_{window}_f'] = test_max
-                            df.loc[test_indices, f'rolling_min_{window}_f'] = test_min
-
-        return df
-
-    def generate_ewm_features(self, df: pd.DataFrame, spans: List[int] = None) -> pd.DataFrame:
-        """
-        指数移動平均ベースの特徴量を追加（リーク防止）
-
-        Args:
-            df: 入力データ
-            spans: EMAに使用するスパン
-
-        Returns:
-            EMA特徴量を追加したデータ
-        """
-        if spans is None:
-            spans = [7, 14, 30]
-
-        print(f"\nGenerating exponential moving features (NO LEAK): {spans}")
-
-        if 'data_type' not in df.columns:
-            raise ValueError("data_type column must exist. Run split_train_test first.")
-
-        for span in spans:
-            col = f'ewm_mean_{span}_f'
-            df[col] = np.nan
-
-            for material_key in df['material_key'].unique():
-                mask = df['material_key'] == material_key
-                material_df = df[mask].sort_values('file_date')
-
-                train_mask = material_df['data_type'] == 'train'
-                train_idx = material_df[train_mask].index
-
-                if train_mask.any():
-                    train_values = material_df.loc[train_idx, 'actual_value'].astype(float)
-                    ewm_values = train_values.ewm(span=span, adjust=False).mean()
-                    df.loc[train_idx, col] = ewm_values.values
-
-                test_mask = material_df['data_type'] == 'test'
-                test_idx = material_df[test_mask].index
-
-                if test_mask.any() and train_mask.any():
-                    last_value = df.loc[train_idx[-1], col]
-                    df.loc[test_idx, col] = last_value
-
-        return df
-
-    def generate_product_profile_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        商品プロファイル特徴量を生成
-
-        Args:
-            df: 入力データ
-
-        Returns:
-            商品プロファイル特徴量を追加したデータ
-        """
-        print("\nGenerating product profile features...")
-
-        # 学習データのみから統計量を計算（データリーク防止）
-        train_df = df[df['data_type'] == 'train']
-        product_stats = train_df.groupby('material_key')['actual_value'].agg([
-            'mean', 'std', 'median', 'min', 'max'
-        ]).reset_index()
-
-        product_stats.columns = ['material_key'] + [f'product_{col}_f' for col in product_stats.columns[1:]]
-
-        # 全データ（train+test）にマージ
-        df = pd.merge(df, product_stats, on='material_key', how='left')
-
-        print(f"Added product profile features (calculated from {len(train_df)} train records)")
-
-        return df
-
-    def generate_trend_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        トレンド特徴量を生成（データリーク防止版）
-
-        Args:
-            df: 入力データ（data_typeカラムが必要）
-
-        Returns:
-            トレンド特徴量を追加したデータ
-        """
-        print("\nGenerating trend features (NO LEAK)...")
-
-        # data_typeが存在しない場合はエラー
-        if 'data_type' not in df.columns:
-            raise ValueError("data_type column must exist. Run split_train_test first.")
-
-        # 新しいカラムを初期化
-        df['trend_7d_f'] = np.nan
-        df['trend_28d_f'] = np.nan
-
-        # 各商品ごとに処理
-        for material_key in df['material_key'].unique():
-            material_mask = df['material_key'] == material_key
-            material_df = df[material_mask].copy()
-            material_df = material_df.sort_values('file_date')
-
-            # 学習データのトレンド特徴量
-            train_mask = (material_df['data_type'] == 'train')
-            if train_mask.any():
-                train_indices = material_df[train_mask].index
-                train_values = material_df[train_mask]['actual_value'].values
-
-                # 7日前からの変化率
-                trend_7d = pd.Series(train_values).pct_change(7).fillna(0).values
-                df.loc[train_indices, 'trend_7d_f'] = trend_7d
-
-                # 28日前からの変化率
-                trend_28d = pd.Series(train_values).pct_change(28).fillna(0).values
-                df.loc[train_indices, 'trend_28d_f'] = trend_28d
-
-            # テストデータのトレンド特徴量（学習期間最後の値から計算）
-            test_mask = (material_df['data_type'] == 'test')
-            if test_mask.any() and train_mask.any():
-                test_indices = material_df[test_mask].index
-                train_values = material_df[train_mask]['actual_value'].values
-
-                # 学習期間最後の7日間と28日間のトレンドを計算
-                if len(train_values) >= 28:
-                    # 7日前からの変化率
-                    trend_7d_value = (train_values[-1] - train_values[-8]) / (train_values[-8] + 1) if len(train_values) >= 8 else 0
-                    # 28日前からの変化率
-                    trend_28d_value = (train_values[-1] - train_values[-29]) / (train_values[-29] + 1)
-
-                    # テスト期間のすべての行に同じ値を設定
-                    df.loc[test_indices, 'trend_7d_f'] = trend_7d_value
-                    df.loc[test_indices, 'trend_28d_f'] = trend_28d_value
-                elif len(train_values) > 0:
-                    # データが不足している場合は0を設定
-                    df.loc[test_indices, 'trend_7d_f'] = 0
-                    df.loc[test_indices, 'trend_28d_f'] = 0
-
-        return df
-
-    def generate_event_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        祝日・連休等のイベントフラグを生成
-        """
-        print("\nGenerating event features...")
-
-        dates = df['file_date']
-        year_series = dates.dt.year.astype(str)
-
-        # 年初1週の需要低下フラグ
-        new_year_start = pd.to_datetime(year_series + "-01-01")
-        new_year_end = pd.to_datetime(year_series + "-01-07")
-        df['is_new_year_period_f'] = dates.between(new_year_start, new_year_end, inclusive='both').astype(int)
-
-        # 会計期関連
-        df['is_fiscal_year_start_f'] = ((dates.dt.month == 4) & (dates.dt.day <= 7)).astype(int)
-        df['is_fiscal_year_end_f'] = ((dates.dt.month == 3) & (dates.dt.day >= 25)).astype(int)
-
-        # ゴールデンウイーク (4/29-5/5)
-        gw_start = pd.to_datetime(year_series + "-04-29")
-        gw_end = pd.to_datetime(year_series + "-05-05")
-        df['is_golden_week_f'] = dates.between(gw_start, gw_end, inclusive='both').astype(int)
-
-        # 連休明け補正: ゴールデンウイーク明け1週間
-        gw_after_start = gw_end + pd.Timedelta(days=1)
-        gw_after_end = gw_after_start + pd.Timedelta(days=6)
-        df['is_post_golden_week_f'] = dates.between(gw_after_start, gw_after_end, inclusive='both').astype(int)
-
-        # ISO週番号
-        df['iso_weekofyear_f'] = dates.dt.isocalendar().week.astype(int)
-
-        return df
-
-    def generate_recent_baseline_features(self, df: pd.DataFrame, train_end_date: str) -> pd.DataFrame:
-        """
-        学習期間の最終値を基準にしたベースライン差分を算出
-        """
-        print("\nGenerating recent baseline features...")
-
-        cutoff = pd.to_datetime(train_end_date)
-        last_values = (
-            df[df['file_date'] <= cutoff]
-            .sort_values('file_date')
-            .groupby('material_key')['actual_value']
-            .last()
-        )
-
-        df['last_train_actual_f'] = df['material_key'].map(last_values)
-
-        # 直近ベースラインとラグ値の比較
-        df['ratio_lag1_to_last_train_f'] = np.where(
-            (df['last_train_actual_f'] > 0) & (~df['lag_1_f'].isna()),
-            df['lag_1_f'] / df['last_train_actual_f'],
-            np.nan
-        )
-        df['diff_lag1_last_train_f'] = np.where(
-            ~df['lag_1_f'].isna(),
-            df['lag_1_f'] - df['last_train_actual_f'],
-            np.nan
-        )
-
-        return df
-
-    def generate_dow_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        曜日別の特徴量を生成
-        """
-        print("\nGenerating day-of-week features...")
-
-        # material_dow_mean_f: Material Key×曜日の過去平均
-        df = self._create_entity_dow_mean(df, 'material_key', 'material_dow_mean_f')
-
-        # store_code_dow_mean_f: Store Code×曜日の過去平均
-        if 'store_code' in df.columns:
-            df = self._create_entity_dow_mean(df, 'store_code', 'store_code_dow_mean_f')
-        else:
-            print("Warning: store_code column not found, skipping store_code_dow_mean_f")
-
-        print("Day-of-week features completed")
-        return df
-
-    def _create_entity_dow_mean(self, df: pd.DataFrame, entity_col: str, feature_name: str) -> pd.DataFrame:
-        """エンティティ×曜日の過去平均を計算（学習データのみ使用）"""
-        print(f"  Creating {feature_name}...")
-
-        # 学習データから統計を計算
-        train_df = df[df['data_type'] == 'train']
-        dow_stats = train_df.groupby([entity_col, 'day_of_week_f'])['actual_value'].mean().reset_index()
-        dow_stats.columns = [entity_col, 'day_of_week_f', feature_name]
-
-        # 全データにマージ
-        df = pd.merge(df, dow_stats, on=[entity_col, 'day_of_week_f'], how='left')
-
-        return df
-
-    def split_train_test(self, df: pd.DataFrame, train_end_date: str) -> pd.DataFrame:
-        """
-        学習データとテストデータを分割
-
-        Args:
-            df: 入力データ
-            train_end_date: 学習データの終了日
-
-        Returns:
-            data_typeカラムを追加したデータ
-        """
-        print(f"\nSplitting train/test data (train_end_date: {train_end_date})")
-
-        train_end = pd.to_datetime(train_end_date)
-        df['data_type'] = df['file_date'].apply(
-            lambda x: 'train' if x <= train_end else 'test'
-        )
-
-        train_size = (df['data_type'] == 'train').sum()
-        test_size = (df['data_type'] == 'test').sum()
-
-        print(f"Train size: {train_size:,} ({train_size/len(df)*100:.1f}%)")
-        print(f"Test size: {test_size:,} ({test_size/len(df)*100:.1f}%)")
-
-        return df
-
-    def validate_split(self, df: pd.DataFrame, train_end_date: str) -> None:
-        """
-        データ分割がリークを起こしていないか検証する。
-
-        Args:
-            df: split_train_test 後のデータ
-            train_end_date: 学習データの終了日
-        """
-        train_end = pd.to_datetime(train_end_date)
-        leaked_rows = df[(df['data_type'] == 'train') & (df['file_date'] > train_end)]
-        if not leaked_rows.empty:
-            raise ValueError(
-                "Train split contains records beyond train_end_date. "
-                "Please verify data preparation."
+        if not self._require_history():
+            return None
+
+        history = self._history_list()
+        features: Dict[str, float] = {}
+
+        def last_value(offset: int) -> float:
+            return float(history[-offset]) if len(history) >= offset else np.nan
+
+        # ラグ
+        features["lag_1_f"] = last_value(1)
+        features["lag_2_f"] = last_value(2)
+        features["lag_3_f"] = last_value(3)
+        features["lag_7_f"] = last_value(7)
+        features["lag_14_f"] = last_value(14)
+        features["lag_28_f"] = last_value(28)
+
+        # ローリング
+        for window in ROLLING_WINDOWS:
+            window_values = history[-window:]
+            features[f"rolling_mean_{window}_f"] = float(np.mean(window_values))
+            features[f"rolling_min_{window}_f"] = float(np.min(window_values))
+            features[f"rolling_max_{window}_f"] = float(np.max(window_values))
+
+        for window in STD_WINDOWS:
+            window_values = history[-window:]
+            features[f"rolling_std_{window}_f"] = float(np.std(window_values, ddof=0))
+
+        for window in NONZERO_WINDOWS:
+            window_values = history[-window:]
+            nonzero_ratio = sum(1 for v in window_values if v > 0) / float(window)
+            features[f"recent_nonzero_ratio_{window}_f"] = float(nonzero_ratio)
+
+        # EWM
+        for span in self.ewm_spans:
+            features[f"ewm_mean_{span}_f"] = float(
+                self.ewm_state.get(span) if self.ewm_state.get(span) is not None else 0.0
             )
-        print("Split validation passed: train data does not extend beyond train_end_date.")
 
-    def save_features(self, df: pd.DataFrame):
-        """
-        特徴量をローカルに保存
-        """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 期間ギャップ
+        if self.history_dates:
+            last_date = self.history_dates[-1]
+            features["days_since_last_obs_f"] = float((current_date - last_date).days)
+            if self.last_nonzero_date is not None:
+                features["days_since_last_nonzero_f"] = float(
+                    (current_date - self.last_nonzero_date).days
+                )
+            else:
+                features["days_since_last_nonzero_f"] = float((current_date - last_date).days)
+            features["gap_business_days_f"] = float(count_business_days(last_date, current_date))
+        else:
+            features["days_since_last_obs_f"] = 0.0
+            features["days_since_last_nonzero_f"] = 0.0
+            features["gap_business_days_f"] = 0.0
 
-        # work/data/featuresに保存
-        features_dir = os.path.join(self.base_dir, 'features')
-        os.makedirs(features_dir, exist_ok=True)
+        # 累積統計
+        features["cumulative_mean_f"] = float(np.mean(history))
+        features["cumulative_std_f"] = float(np.std(history, ddof=0))
 
-        local_path_with_timestamp = os.path.join(features_dir, f"product_level_features_{timestamp}.parquet")
-        local_path_latest = os.path.join(features_dir, "product_level_features_latest.parquet")
+        # トレンド
+        for lag in TREND_LAGS:
+            prev = last_value(lag)
+            features[f"trend_{lag}_ratio_f"] = safe_ratio(history[-1], prev)
 
-        for path in [local_path_with_timestamp, local_path_latest]:
-            print(f"\nSaving to local: {path}")
-            df.to_parquet(path, index=False)
-            print(f"  File size: {os.path.getsize(path) / (1024*1024):.2f} MB")
+        # 季節要因
+        month = int(current_date.month)
+        month_mean_map: Dict[int, float] = static_info.get("month_mean_map", {})
+        month_std_map: Dict[int, float] = static_info.get("month_std_map", {})
+        seasonal_mean = month_mean_map.get(month, static_info.get("product_mean_f", 0.0))
+        seasonal_std = month_std_map.get(month, static_info.get("product_std_f", 0.0))
+        features["seasonal_month_mean_f"] = float(seasonal_mean)
+        features["seasonal_month_std_f"] = float(seasonal_std)
 
-        print(f"\nSaved successfully: {len(df)} rows, {df.shape[1]} columns")
+        # 定数（静的）特徴量
+        for key in STATIC_FEATURES:
+            features[key] = float(static_info.get(key, 0.0))
 
-    def run(self, train_end_date: str = "2024-12-31", step_count: int = 1):
-        """
-        メイン処理（データリーク防止版）
+        # カレンダ特徴量
+        features.update(self._calendar_features(current_date))
 
-        Args:
-            train_end_date: 学習データの終了日
-            step_count: 予測月数
-        """
-        print("="*60)
-        print("Product-level Feature Generation (No Data Leakage Version)")
-        print(f"Timestamp: {datetime.now()}")
-        print(f"Parameters: train_end_date={train_end_date}, step_count={step_count}")
-        print("="*60)
-
-        # 1. データ読み込み
-        df = self.load_data()
-
-        # 2. データ分割（最初に実行：データリーク防止の核心）
-        df = self.split_train_test(df, train_end_date)
-        self.validate_split(df, train_end_date)
-
-        # 統計情報の表示
-        train_size = (df['data_type'] == 'train').sum()
-        test_size = (df['data_type'] == 'test').sum()
-        print(f"\nData split completed:")
-        print(f"  Train: {train_size:,} records (~{train_end_date})")
-        print(f"  Test:  {test_size:,} records ({train_end_date}~)")
-
-        # 3. 基本特徴量
-        df = self.generate_basic_features(df)
-
-        # 4. ラグ特徴量
-        df = self.generate_lag_features(df)
-
-        # 5. 移動統計特徴量
-        df = self.generate_rolling_features(df)
-
-        # 6. EMA特徴量
-        df = self.generate_ewm_features(df)
-
-        # 7. 商品プロファイル特徴量（学習データのみから統計を計算）
-        df = self.generate_product_profile_features(df)
-
-        # 8. トレンド特徴量
-        df = self.generate_trend_features(df)
-
-        # 9. イベント特徴量
-        df = self.generate_event_features(df)
-
-        # 10. 曜日別特徴量（学習データのみから統計を計算）
-        df = self.generate_dow_features(df)
-
-        # 11. 直近期値ベースライン特徴量
-        df = self.generate_recent_baseline_features(df, train_end_date)
-
-        # 12. 保存
-        self.save_features(df)
-
-        # サマリー
-        print("\n" + "="*60)
-        print("Feature Generation Summary")
-        print("="*60)
-
-        feature_cols = [col for col in df.columns if col.endswith('_f')]
-        print(f"Total features: {len(feature_cols)}")
-        print(f"Feature columns: {feature_cols[:10]}...")
-
-        return df
+        return features
 
 
-def main():
-    """メイン処理"""
-    import argparse
+# --------------------------------------------------------------------------------------
+# 静的情報（商品プロファイル）の作成
+# --------------------------------------------------------------------------------------
 
-    parser = argparse.ArgumentParser(description='商品レベル特徴量生成')
-    parser.add_argument(
-        '--train_end_date',
-        type=str,
-        default='2024-12-31',
-        help='学習データの終了日 (YYYY-MM-DD形式、デフォルト: 2024-12-31)'
+def build_material_index_map(material_keys: Iterable[str]) -> Dict[str, int]:
+    """Material Key を 0 ベースの整数にマッピングする。"""
+    return {key: idx for idx, key in enumerate(sorted(material_keys))}
+
+
+def prepare_static_info(
+    train_df: pd.DataFrame,
+    material_index_map: Dict[str, int],
+    volume_threshold: float = VOLUME_THRESHOLD,
+) -> Dict[str, Dict[str, float]]:
+    """商品ごとの統計情報を作成する。"""
+    stats = (
+        train_df.groupby("material_key")["actual_value"]
+        .agg(["mean", "std", "median", "min", "max", "sum", "count"])
+        .rename(
+            columns={
+                "mean": "product_mean_f",
+                "std": "product_std_f",
+                "median": "product_median_f",
+                "min": "product_min_f",
+                "max": "product_max_f",
+                "sum": "product_sum_f",
+                "count": "product_count_f",
+            }
+        )
     )
-    parser.add_argument(
-        '--step_count',
-        type=int,
-        default=1,
-        help='予測月数 (デフォルト: 1)'
+
+    month_stats = train_df.copy()
+    month_stats["month"] = month_stats["file_date"].dt.month
+    month_stats = (
+        month_stats.groupby(["material_key", "month"])["actual_value"]
+        .agg(["mean", "std"])
+        .rename(columns={"mean": "month_mean", "std": "month_std"})
     )
-    args = parser.parse_args()
 
-    generator = ProductFeatureGenerator()
-    df = generator.run(train_end_date=args.train_end_date, step_count=args.step_count)
+    static_info: Dict[str, Dict[str, float]] = {}
+    for material_key, idx in material_index_map.items():
+        if material_key in stats.index:
+            row = stats.loc[material_key]
+        else:
+            row = pd.Series(
+                {
+                    "product_mean_f": 0.0,
+                    "product_std_f": 0.0,
+                    "product_median_f": 0.0,
+                    "product_min_f": 0.0,
+                    "product_max_f": 0.0,
+                    "product_sum_f": 0.0,
+                    "product_count_f": 0.0,
+                }
+            )
 
-    # 特徴量の統計情報
-    print("\nFeature statistics:")
-    feature_cols = [col for col in df.columns if col.endswith('_f')]
-    print(df[feature_cols].describe().T.head(10))
+        month_mean_map: Dict[int, float] = {}
+        month_std_map: Dict[int, float] = {}
+        if material_key in month_stats.index.get_level_values(0):
+            month_slice = month_stats.loc[material_key]
+            if isinstance(month_slice, pd.Series):
+                # 単月のみの場合 Series になるので dict へ変換
+                month_mean_map[int(month_slice.name)] = float(month_slice["month_mean"])
+                month_std_map[int(month_slice.name)] = float(
+                    month_slice["month_std"] if not np.isnan(month_slice["month_std"]) else 0.0
+                )
+            else:
+                for month, values in month_slice.iterrows():
+                    month_mean_map[int(month)] = float(values["month_mean"])
+                    month_std_map[int(month)] = float(
+                        values["month_std"] if not np.isnan(values["month_std"]) else 0.0
+                    )
+
+        volume_segment = 1.0 if row["product_sum_f"] >= volume_threshold else 0.0
+
+        static_info[material_key] = {
+            "material_idx": float(idx),
+            "product_mean_f": float(row["product_mean_f"]) if not np.isnan(row["product_mean_f"]) else 0.0,
+            "product_std_f": float(row["product_std_f"]) if not np.isnan(row["product_std_f"]) else 0.0,
+            "product_median_f": float(row["product_median_f"]) if not np.isnan(row["product_median_f"]) else 0.0,
+            "product_min_f": float(row["product_min_f"]) if not np.isnan(row["product_min_f"]) else 0.0,
+            "product_max_f": float(row["product_max_f"]) if not np.isnan(row["product_max_f"]) else 0.0,
+            "volume_segment_f": float(volume_segment),
+            "month_mean_map": month_mean_map,
+            "month_std_map": month_std_map,
+        }
+
+    return static_info
+
+
+# --------------------------------------------------------------------------------------
+# 特徴量生成メインロジック
+# --------------------------------------------------------------------------------------
+
+def generate_training_features(
+    aggregated_df: pd.DataFrame,
+    train_end_date: str,
+    min_history: int = MIN_HISTORY,
+    max_history: int = MAX_HISTORY,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]]]:
+    """
+    学習用の特徴量を生成する。
+
+    Returns:
+        features_df, static_info_map
+    """
+    train_end = pd.to_datetime(train_end_date)
+    train_df = aggregated_df[aggregated_df["file_date"] <= train_end].copy()
+    if train_df.empty:
+        raise ValueError("No training data found up to train_end_date.")
+
+    material_index_map = build_material_index_map(train_df["material_key"].unique())
+    static_info_map = prepare_static_info(train_df, material_index_map)
+
+    records: List[Dict[str, float]] = []
+
+    for material_key, group in train_df.groupby("material_key"):
+        group = group.sort_values("file_date")
+        state = FeatureState(min_history=min_history, max_history=max_history)
+        static_info = static_info_map[material_key]
+
+        for row in group.itertuples(index=False):
+            current_date: pd.Timestamp = row.file_date
+            current_value: float = float(row.actual_value)
+
+            feature_row = state.build_feature_row(current_date, static_info)
+            if feature_row is not None:
+                record = {
+                    "material_key": material_key,
+                    "file_date": current_date,
+                    "actual_value": current_value,
+                }
+                for col in FEATURE_COLUMNS:
+                    record[col] = feature_row[col]
+                records.append(record)
+
+            state.add_observation(current_date, current_value)
+
+    if not records:
+        raise RuntimeError("No feature rows were generated – consider reducing MIN_HISTORY.")
+
+    features_df = pd.DataFrame(records)
+    features_df.sort_values(["material_key", "file_date"], inplace=True)
+
+    return features_df, static_info_map
+
+
+def save_static_info(
+    static_info_map: Dict[str, Dict[str, float]],
+    output_dir: str,
+) -> str:
+    """静的情報を JSON として保存する。"""
+    ensure_directory(output_dir)
+
+    # JSON シリアライズ可能な形式へ変換（タイムスタンプなどは不要）
+    serializable: Dict[str, Dict[str, object]] = {}
+    for key, info in static_info_map.items():
+        serializable[key] = {
+            "material_idx": info["material_idx"],
+            "product_mean_f": info["product_mean_f"],
+            "product_std_f": info["product_std_f"],
+            "product_median_f": info["product_median_f"],
+            "product_min_f": info["product_min_f"],
+            "product_max_f": info["product_max_f"],
+            "volume_segment_f": info["volume_segment_f"],
+            "month_mean_map": {str(k): float(v) for k, v in info["month_mean_map"].items()},
+            "month_std_map": {str(k): float(v) for k, v in info["month_std_map"].items()},
+        }
+
+    path = os.path.join(output_dir, STATIC_INFO_FILENAME)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def save_features(features_df: pd.DataFrame, output_dir: str) -> Tuple[str, str]:
+    ensure_directory(output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    latest_path = os.path.join(output_dir, FEATURE_FILENAME_LATEST)
+    dated_path = os.path.join(output_dir, FEATURE_FILENAME_TEMPLATE.format(timestamp=timestamp))
+
+    for path in (latest_path, dated_path):
+        features_df.to_parquet(path, index=False)
+
+    return latest_path, dated_path
+
+
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+
+def main(base_dir: str = DEFAULT_BASE_DIR, train_end_date: str = "2024-12-31") -> None:
+    print("=" * 60)
+    print("Product-level Feature Generation (Sequential Ready)")
+    print(f"Timestamp: {datetime.now()}")
+    print(f"Parameters: base_dir={base_dir}, train_end_date={train_end_date}")
+    print("=" * 60)
+
+    aggregated_df = load_aggregated_data(base_dir)
+    print(f"Loaded aggregated data: {len(aggregated_df):,} rows, "
+          f"{aggregated_df['material_key'].nunique():,} material keys")
+    print(f"Date range: {aggregated_df['file_date'].min()} ~ {aggregated_df['file_date'].max()}")
+
+    features_df, static_info_map = generate_training_features(
+        aggregated_df=aggregated_df,
+        train_end_date=train_end_date,
+        min_history=MIN_HISTORY,
+        max_history=MAX_HISTORY,
+    )
+
+    print(f"\nGenerated training features: {len(features_df):,} rows, "
+          f"{features_df['material_key'].nunique():,} material keys")
+    print(f"Feature columns ({len(FEATURE_COLUMNS)}): {FEATURE_COLUMNS}")
+
+    features_dir = os.path.join(base_dir, "features")
+    latest_path, dated_path = save_features(features_df, features_dir)
+    static_path = save_static_info(static_info_map, features_dir)
+
+    print("\nSaved files:")
+    print(f"  Latest features : {latest_path}")
+    print(f"  Timestamped     : {dated_path}")
+    print(f"  Static info     : {static_path}")
+
+    print("\nSummary statistics:")
+    print(features_df["actual_value"].describe())
+
+    print("\nFeature generation completed successfully.")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate product-level features with sequential support.")
+    parser.add_argument(
+        "--base-dir",
+        type=str,
+        default=DEFAULT_BASE_DIR,
+        help=f"データのベースディレクトリ (default: {DEFAULT_BASE_DIR})",
+    )
+    parser.add_argument(
+        "--train-end-date",
+        type=str,
+        default="2024-12-31",
+        help="学習データの終了日 (YYYY-MM-DD)",
+    )
+
+    args = parser.parse_args()
+    main(base_dir=args.base_dir, train_end_date=args.train_end_date)

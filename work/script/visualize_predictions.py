@@ -1,437 +1,287 @@
 #!/usr/bin/env python3
 """
-商品レベル予測結果の可視化スクリプト（パラメータ対応版）
-- inputファイルパスをパラメータで指定
-- outputパスをパラメータで指定
-- 1~12ヶ月のデータに対応
-- 商品コードごとに最初にデータがあったタイミングから最後まで表示
+商品レベル予測結果の可視化スクリプト（逐次更新対応版）
+
+主な変更点
+-----------
+- 日付リインデックス時にゼロ埋めを行わず、欠測は欠測のまま保持
+- 予測値・実績値の誤差指標を読み込み時に付与
+- サマリ（CSV/JSON/TXT）とグラフ出力のユーティリティ `generate_reports` を提供
 """
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-from pathlib import Path
-import json
-import warnings
+
+from __future__ import annotations
+
 import argparse
 from datetime import datetime
-warnings.filterwarnings('ignore')
+from pathlib import Path
+from typing import Dict, Optional
 
-# 日本語フォント設定 - 利用可能なフォントのみを設定
 import matplotlib
-matplotlib.use('Agg')  # バックエンドを設定
-# 警告を出さないようにするため、存在するフォントのみを使用
-plt.rcParams['font.family'] = 'DejaVu Sans'
-# 日本語が必要な場合は以下を有効化（警告を承知の上で）
-# plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+matplotlib.use("Agg")
+plt.rcParams["font.family"] = "DejaVu Sans"
+
 
 class PredictionVisualizer:
-    """予測結果の可視化クラス"""
+    """予測結果の可視化・サマリ生成を担当するクラス"""
 
-    def __init__(self, input_file, output_dir, historical_data_file=None):
-        """
-        初期化
-
-        Args:
-            input_file: 予測結果CSVファイルパス
-            output_dir: 出力ディレクトリパス
-            historical_data_file: 過去データのparquetファイルパス（商品ごとのデータ期間確認用）
-        """
+    def __init__(
+        self,
+        input_file: str,
+        output_dir: str,
+        historical_data_file: Optional[str] = None,
+        horizon_months: Optional[int] = 6,
+    ) -> None:
         self.input_file = Path(input_file)
         self.output_dir = Path(output_dir)
         self.historical_data_file = Path(historical_data_file) if historical_data_file else None
+        self.horizon_months = horizon_months
 
-        # 出力用サブディレクトリ
-        self.graph_dir = self.output_dir / 'graph'
-        self.summary_dir = self.output_dir / 'summary'
-
-        # ディレクトリ作成
+        self.graph_dir = self.output_dir / "graph"
+        self.summary_dir = self.output_dir / "summary"
         self.graph_dir.mkdir(parents=True, exist_ok=True)
         self.summary_dir.mkdir(parents=True, exist_ok=True)
 
-    def load_prediction_data(self):
-        """予測結果CSVファイルを読み込む"""
-        print(f"予測結果を読み込んでいます: {self.input_file}")
-        df = pd.read_csv(self.input_file)
-        df['date'] = pd.to_datetime(df['date'])
-        print(f"  読み込み完了: {len(df)}行, 期間: {df['date'].min()} ~ {df['date'].max()}")
+    # ------------------------------------------------------------------
+    # データ読み込み
+    # ------------------------------------------------------------------
+    def load_prediction_data(self) -> pd.DataFrame:
+        """予測結果を読み込み、誤差列を付与する。"""
+        print(f"予測結果を読み込み: {self.input_file}")
+        if not self.input_file.exists():
+            raise FileNotFoundError(f"Prediction file not found: {self.input_file}")
+
+        if self.input_file.suffix.lower() == ".parquet":
+            df = pd.read_parquet(self.input_file)
+        else:
+            df = pd.read_csv(self.input_file)
+
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values(["material_key", "date"])
+        df["error"] = df["predicted"] - df["actual"]
+        df["abs_error"] = df["error"].abs()
+        denom = np.abs(df["predicted"]) + np.abs(df["actual"]) + 1e-6
+        df["smape_pct"] = 200 * df["abs_error"] / denom
+        df["predict_year_month"] = df["date"].dt.strftime("%Y-%m")
+        df["relative_error"] = df["smape_pct"] / 100.0
+
+        print(f"  行数: {len(df):,}, 期間: {df['date'].min()} ~ {df['date'].max()}")
         return df
 
-    def load_historical_data(self):
-        """過去データを読み込み、商品ごとのデータ開始日を取得"""
+    def load_historical_data(self) -> Optional[pd.DataFrame]:
+        """過去実績データを必要に応じて読み込む。"""
         if self.historical_data_file and self.historical_data_file.exists():
-            print(f"\n過去データを読み込んでいます: {self.historical_data_file}")
+            print(f"過去データを読み込み: {self.historical_data_file}")
             hist_df = pd.read_parquet(self.historical_data_file)
+            hist_df["file_date"] = pd.to_datetime(hist_df["file_date"])
+            return hist_df
+        print("過去データファイルが見つからないため、履歴表示をスキップします。")
+        return None
 
-            # file_dateカラムを日付型に変換
-            hist_df['file_date'] = pd.to_datetime(hist_df['file_date'])
+    # ------------------------------------------------------------------
+    # 精度指標
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _compute_metrics_for_product(product_df: pd.DataFrame) -> Dict[str, float]:
+        mae = float(product_df["abs_error"].mean())
+        rmse = float(np.sqrt(np.mean(product_df["error"] ** 2)))
+        actual_sum = float(product_df["actual"].sum())
+        predicted_sum = float(product_df["predicted"].sum())
+        n_samples = int(len(product_df))
 
-            # 商品コード（material_key）ごとの最初のデータ日付を取得
-            product_start_dates = hist_df.groupby('material_key')['file_date'].agg(['min', 'max']).to_dict()
+        smape = float(product_df["smape_pct"].mean())
+        accuracy = float(100 - smape)
+        wape = float(np.sum(product_df["abs_error"]) / (np.sum(np.abs(product_df["actual"])) + 1e-6) * 100)
 
-            print(f"  過去データ期間: {hist_df['file_date'].min()} ~ {hist_df['file_date'].max()}")
-            print(f"  商品コード数: {hist_df['material_key'].nunique()}")
+        return {
+            "mape": smape,
+            "mae": mae,
+            "rmse": rmse,
+            "accuracy": accuracy,
+            "wape": wape,
+            "n_samples": n_samples,
+            "actual_sum": actual_sum,
+            "predicted_sum": predicted_sum,
+        }
 
-            return hist_df, product_start_dates
-        else:
-            print("過去データファイルが指定されていないか、存在しません")
-            return None, {}
+    def calculate_accuracy_metrics(self, df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+        metrics = {}
+        for material_key, group in df.groupby("material_key"):
+            metrics[material_key] = self._compute_metrics_for_product(group)
+        return metrics
 
-    def calculate_accuracy_metrics(self, df):
-        """精度指標を計算"""
-        accuracy_by_product = {}
+    # ------------------------------------------------------------------
+    # グラフ生成
+    # ------------------------------------------------------------------
+    def create_product_graph(
+        self,
+        pred_df: pd.DataFrame,
+        product_code: str,
+        hist_df: Optional[pd.DataFrame] = None,
+    ) -> None:
+        product_pred_df = pred_df[pred_df["material_key"] == product_code].copy()
+        if product_pred_df.empty:
+            return
 
-        for product in df['material_key'].unique():
-            product_df = df[df['material_key'] == product].copy()
+        product_pred_df = product_pred_df.sort_values("date")
 
-            # MAPE (Mean Absolute Percentage Error) の計算
-            # 実績値が0の場合を除外
-            valid_rows = product_df[product_df['actual'] != 0]
-            if len(valid_rows) > 0:
-                mape = np.mean(np.abs((valid_rows['actual'] - valid_rows['predicted']) / valid_rows['actual']) * 100)
-            else:
-                mape = np.nan
-
-            # MAE (Mean Absolute Error) の計算
-            mae = np.mean(product_df['abs_error'])
-
-            # RMSE (Root Mean Square Error) の計算
-            rmse = np.sqrt(np.mean(product_df['error'] ** 2))
-
-            # 精度 (100 - MAPE) として計算
-            accuracy = 100 - mape if not np.isnan(mape) else np.nan
-
-            accuracy_by_product[product] = {
-                'mape': mape,
-                'mae': mae,
-                'rmse': rmse,
-                'accuracy': accuracy,
-                'n_samples': len(product_df),
-                'actual_sum': product_df['actual'].sum(),
-                'predicted_sum': product_df['predicted'].sum()
-            }
-
-        return accuracy_by_product
-
-    def create_product_graph(self, pred_df, product_code, hist_df=None):
-        """
-        商品コードごとの実績と予測の折れ線グラフを作成
-        過去データがある場合は、予測対象月の半年前から表示
-        """
-        # 予測期間のデータ
-        product_pred_df = pred_df[pred_df['material_key'] == product_code].copy()
-        product_pred_df = product_pred_df.sort_values('date')
+        if self.horizon_months is not None:
+            earliest = product_pred_df["date"].min()
+            cutoff = earliest + pd.DateOffset(months=self.horizon_months)
+            product_pred_df = product_pred_df[product_pred_df["date"] <= cutoff]
 
         plt.figure(figsize=(14, 7))
 
-        # 過去データがある場合は追加
-        if hist_df is not None and product_code in hist_df['material_key'].unique():
-            product_hist_df = hist_df[hist_df['material_key'] == product_code].copy()
-            product_hist_df = product_hist_df.sort_values('file_date')
-
-            # 予測対象月の最初の月から半年前の日付を計算
-            pred_start_date = product_pred_df['date'].min()
-            six_months_before = pred_start_date - pd.DateOffset(months=6)
-
-            # 予測期間の最終日を取得（実際の予測がある最終日）
-            pred_end_date = product_pred_df['date'].max()
-
-            # 半年前から予測開始前日までのデータのみをフィルタリング（予測期間は含まない）
+        if hist_df is not None and product_code in hist_df["material_key"].values:
+            product_hist_df = hist_df[hist_df["material_key"] == product_code].copy()
+            product_hist_df = product_hist_df.sort_values("file_date")
+            pred_start = product_pred_df["date"].min()
+            hist_start = pred_start - pd.DateOffset(months=6)
             product_hist_df = product_hist_df[
-                (product_hist_df['file_date'] >= six_months_before) &
-                (product_hist_df['file_date'] < pred_start_date)
+                (product_hist_df["file_date"] >= hist_start)
+                & (product_hist_df["file_date"] < pred_start)
             ]
+            if not product_hist_df.empty:
+                plt.plot(
+                    product_hist_df["file_date"],
+                    product_hist_df["actual_value"],
+                    color="lightgray",
+                    linewidth=1.5,
+                    label="Historical Actual (6 months)",
+                    alpha=0.5,
+                )
 
-            # 過去データの実績値（薄い灰色）
-            if len(product_hist_df) > 0:
-                plt.plot(product_hist_df['file_date'], product_hist_df['actual_value'],
-                        color='lightgray', linewidth=1.5, marker='',
-                        label='Historical Actual (6 months)', alpha=0.5)
+        plt.plot(
+            product_pred_df["date"],
+            product_pred_df["actual"],
+            color="gray",
+            linewidth=2,
+            marker="o",
+            markersize=5,
+            label="Test Period Actual",
+            alpha=0.7,
+        )
+        plt.plot(
+            product_pred_df["date"],
+            product_pred_df["predicted"],
+            color="red",
+            linewidth=2,
+            marker="s",
+            markersize=5,
+            label="Predicted",
+            alpha=0.7,
+        )
 
-        # 予測期間の実績値（濃い灰色）- 予測が存在する日付のみ表示
-        # 予測値がNaNでない行のみをフィルタリング
-        valid_pred_df = product_pred_df[product_pred_df['predicted'].notna()].copy()
-
-        if len(valid_pred_df) > 0:
-            # 実績値（濃い灰色）- 予測が存在する日付のみ
-            plt.plot(valid_pred_df['date'], valid_pred_df['actual'],
-                    color='gray', linewidth=2, marker='o', markersize=6,
-                    label='Test Period Actual', alpha=0.7)
-
-            # 予測値（赤色）- 予測が存在する日付のみ
-            plt.plot(valid_pred_df['date'], valid_pred_df['predicted'],
-                    color='red', linewidth=2, marker='s', markersize=6,
-                    label='Predicted', alpha=0.7)
-
-        # タイトルと軸ラベル
-        title = f'Product: {product_code} - Actual vs Predicted'
-        if len(valid_pred_df) > 0:
-            accuracy = 100 - np.mean(valid_pred_df['percentage_error'])
-            title += f' (Accuracy: {accuracy:.1f}%)'
+        title = f"Product: {product_code} - Actual vs Predicted"
+        valid_errors = product_pred_df["smape_pct"].dropna()
+        if not valid_errors.empty:
+            title += f" (Accuracy: {100 - valid_errors.mean():.1f}%)"
 
         plt.title(title, fontsize=14)
-        plt.xlabel('Date', fontsize=12)
-        plt.ylabel('Demand', fontsize=12)
-        plt.legend(loc='best')
-        plt.grid(True, alpha=0.3)
-        plt.xticks(rotation=45)
-
-        # y軸の範囲を調整（負の値を避ける）
-        y_min = 0
-        y_max_values = []
-        if hist_df is not None and product_code in hist_df['material_key'].unique():
-            filtered_hist = hist_df[hist_df['material_key'] == product_code]
-            if len(filtered_hist) > 0:
-                y_max_values.append(filtered_hist['actual_value'].max())
-        if len(valid_pred_df) > 0:
-            y_max_values.extend([valid_pred_df['actual'].max(), valid_pred_df['predicted'].max()])
-        if y_max_values:
-            y_max = max(y_max_values) * 1.1
-            plt.ylim(y_min, y_max)
-
+        plt.xlabel("Date", fontsize=12)
+        plt.ylabel("Demand", fontsize=12)
+        plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+        plt.legend(loc="upper right")
         plt.tight_layout()
 
-        # グラフ保存
-        output_path = self.graph_dir / f'{product_code}.png'
-        plt.savefig(output_path, dpi=100, bbox_inches='tight')
+        output_path = self.graph_dir / f"{product_code}.png"
+        plt.savefig(output_path)
         plt.close()
+        print(f"  グラフを出力: {output_path}")
 
-        return output_path
+    # ------------------------------------------------------------------
+    # サマリ保存
+    # ------------------------------------------------------------------
+    def save_summary(
+        self,
+        pred_df: pd.DataFrame,
+        accuracy_by_product: Dict[str, Dict[str, float]],
+    ) -> None:
+        summary_csv = self.summary_dir / "accuracy_summary.csv"
+        summary_json = self.summary_dir / "accuracy_summary.json"
+        summary_txt = self.summary_dir / "accuracy_summary.txt"
 
-    def save_accuracy_summary(self, accuracy_metrics):
-        """精度サマリーを保存"""
+        df_summary = pd.DataFrame.from_dict(accuracy_by_product, orient="index")
+        df_summary.index.name = "material_key"
+        df_summary.reset_index(inplace=True)
+        df_summary.sort_values("accuracy", ascending=False, inplace=True)
+        df_summary.to_csv(summary_csv, index=False)
+        df_summary.to_json(summary_json, orient="records", indent=2, force_ascii=False)
 
-        # DataFrameに変換
-        summary_df = pd.DataFrame.from_dict(accuracy_metrics, orient='index')
-        summary_df.index.name = 'product_code'
-        summary_df = summary_df.reset_index()
+        overall_mae = float(pred_df["abs_error"].mean())
+        overall_rmse = float(np.sqrt(np.mean(pred_df["error"] ** 2)))
+        overall_smape = float(pred_df["smape_pct"].mean())
+        overall_wape = float(np.sum(pred_df["abs_error"]) / (np.sum(np.abs(pred_df["actual"])) + 1e-6) * 100)
 
-        # 全体平均を計算（NaNを除外）
-        overall_metrics = {
-            'product_code': 'OVERALL_MEAN',
-            'mape': summary_df['mape'].mean(skipna=True),
-            'mae': summary_df['mae'].mean(),
-            'rmse': summary_df['rmse'].mean(),
-            'accuracy': summary_df['accuracy'].mean(skipna=True),
-            'n_samples': summary_df['n_samples'].sum(),
-            'actual_sum': summary_df['actual_sum'].sum(),
-            'predicted_sum': summary_df['predicted_sum'].sum()
-        }
+        with open(summary_txt, "w", encoding="utf-8") as f:
+            f.write("=" * 70 + "\n")
+            f.write("Accuracy Summary Report\n")
+            f.write(f"Generated at: {datetime.now()}\n")
+            f.write("=" * 70 + "\n\n")
+            f.write(f"Overall MAE : {overall_mae:.2f}\n")
+            f.write(f"Overall RMSE: {overall_rmse:.2f}\n")
+            f.write(f"Overall sMAPE: {overall_smape:.2f}% "
+                    f"(Accuracy {100 - overall_smape:.2f}%)\n")
+            f.write(f"Overall WAPE : {overall_wape:.2f}%\n")
+            f.write("\nTop 10 products by accuracy:\n")
 
-        # 全体平均を追加
-        summary_with_overall = pd.concat([
-            summary_df,
-            pd.DataFrame([overall_metrics])
-        ], ignore_index=True)
+            for _, row in df_summary.head(10).iterrows():
+                f.write(
+                    f"- {row['material_key']}: Accuracy {row['accuracy']:.2f}%, "
+                    f"sMAPE {row['mape']:.2f}%, WAPE {row.get('wape', np.nan):.2f}%, "
+                    f"MAE {row['mae']:.2f}, RMSE {row['rmse']:.2f}, Samples {row['n_samples']}\n"
+                )
 
-        # CSV形式で保存
-        csv_path = self.summary_dir / 'accuracy_summary.csv'
-        summary_with_overall.to_csv(csv_path, index=False)
+        print(f"サマリを保存: {summary_csv}, {summary_json}, {summary_txt}")
 
-        # JSON形式でも保存
-        json_path = self.summary_dir / 'accuracy_summary.json'
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                'by_product': accuracy_metrics,
-                'overall': overall_metrics,
-                'timestamp': datetime.now().isoformat()
-            }, f, ensure_ascii=False, indent=2, default=float)
+    # ------------------------------------------------------------------
+    # 総合レポート
+    # ------------------------------------------------------------------
+    def generate_reports(
+        self,
+        pred_df: pd.DataFrame,
+        hist_df: Optional[pd.DataFrame] = None,
+    ) -> None:
+        accuracy_by_product = self.calculate_accuracy_metrics(pred_df)
+        self.save_summary(pred_df, accuracy_by_product)
 
-        # テキスト形式のサマリーを作成
-        txt_path = self.summary_dir / 'accuracy_summary.txt'
-        with open(txt_path, 'w', encoding='utf-8') as f:
-            f.write("="*70 + "\n")
-            f.write("予測精度サマリーレポート\n")
-            f.write(f"作成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*70 + "\n\n")
-
-            f.write("【全体サマリー】\n")
-            f.write("-"*40 + "\n")
-            f.write(f"商品コード数: {len(accuracy_metrics)}\n")
-            f.write(f"総サンプル数: {overall_metrics['n_samples']}\n")
-            f.write(f"実績値合計: {overall_metrics['actual_sum']:,.0f}\n")
-            f.write(f"予測値合計: {overall_metrics['predicted_sum']:,.0f}\n")
-            f.write(f"平均MAPE: {overall_metrics['mape']:.2f}%\n")
-            f.write(f"平均MAE: {overall_metrics['mae']:.2f}\n")
-            f.write(f"平均RMSE: {overall_metrics['rmse']:.2f}\n")
-            f.write(f"平均精度: {overall_metrics['accuracy']:.2f}%\n")
-            f.write("\n")
-
-            # 精度別の分布
-            f.write("【精度分布】\n")
-            f.write("-"*40 + "\n")
-            valid_accuracies = [v['accuracy'] for v in accuracy_metrics.values() if not np.isnan(v['accuracy'])]
-            if valid_accuracies:
-                f.write(f"95%以上: {sum(1 for a in valid_accuracies if a >= 95)}/{len(valid_accuracies)} 商品\n")
-                f.write(f"90-95%: {sum(1 for a in valid_accuracies if 90 <= a < 95)}/{len(valid_accuracies)} 商品\n")
-                f.write(f"80-90%: {sum(1 for a in valid_accuracies if 80 <= a < 90)}/{len(valid_accuracies)} 商品\n")
-                f.write(f"70-80%: {sum(1 for a in valid_accuracies if 70 <= a < 80)}/{len(valid_accuracies)} 商品\n")
-                f.write(f"70%未満: {sum(1 for a in valid_accuracies if a < 70)}/{len(valid_accuracies)} 商品\n")
-            f.write("\n")
-
-            f.write("【商品コード別精度 TOP 10】\n")
-            f.write("-"*40 + "\n")
-
-            # 精度でソート（上位10件）
-            sorted_products = sorted(
-                [(k, v) for k, v in accuracy_metrics.items() if not np.isnan(v['accuracy'])],
-                key=lambda x: x[1]['accuracy'],
-                reverse=True
-            )[:10]
-
-            for product, metrics in sorted_products:
-                f.write(f"\n商品コード: {product}\n")
-                f.write(f"  精度: {metrics['accuracy']:.2f}%\n")
-                f.write(f"  MAPE: {metrics['mape']:.2f}%\n")
-                f.write(f"  MAE: {metrics['mae']:.2f}\n")
-                f.write(f"  RMSE: {metrics['rmse']:.2f}\n")
-                f.write(f"  サンプル数: {metrics['n_samples']}\n")
-
-            f.write("\n")
-            f.write("【商品コード別精度 BOTTOM 10】\n")
-            f.write("-"*40 + "\n")
-
-            # 精度でソート（下位10件）
-            bottom_products = sorted(
-                [(k, v) for k, v in accuracy_metrics.items() if not np.isnan(v['accuracy'])],
-                key=lambda x: x[1]['accuracy']
-            )[:10]
-
-            for product, metrics in bottom_products:
-                f.write(f"\n商品コード: {product}\n")
-                f.write(f"  精度: {metrics['accuracy']:.2f}%\n")
-                f.write(f"  MAPE: {metrics['mape']:.2f}%\n")
-                f.write(f"  MAE: {metrics['mae']:.2f}\n")
-                f.write(f"  RMSE: {metrics['rmse']:.2f}\n")
-                f.write(f"  サンプル数: {metrics['n_samples']}\n")
-
-        return csv_path, json_path, txt_path
-
-    def run(self):
-        """メイン処理を実行"""
-        print("="*60)
-        print("商品レベル予測結果の可視化")
-        print(f"実行日時: {datetime.now()}")
-        print("="*60)
-
-        # 予測データ読み込み
-        pred_df = self.load_prediction_data()
-
-        # 過去データ読み込み（指定されている場合）
-        hist_df = None
-        if self.historical_data_file:
-            hist_df, product_dates = self.load_historical_data()
-
-        # 商品コードリスト取得
-        product_codes = pred_df['material_key'].unique()
-        print(f"\n商品コード数: {len(product_codes)}")
-
-        # 精度指標を計算
-        print("\n精度指標を計算中...")
-        accuracy_metrics = self.calculate_accuracy_metrics(pred_df)
-
-        # 精度サマリーを保存
-        print("\n精度サマリーを保存中...")
-        csv_path, json_path, txt_path = self.save_accuracy_summary(accuracy_metrics)
-        print(f"精度サマリー保存完了:")
-        print(f"  - CSV: {csv_path}")
-        print(f"  - JSON: {json_path}")
-        print(f"  - TXT: {txt_path}")
-
-        # 各商品コードのグラフを作成
-        print(f"\n{len(product_codes)}個の商品コードのグラフを作成中...")
-        for i, product_code in enumerate(product_codes, 1):
-            output_path = self.create_product_graph(pred_df, product_code, hist_df)
-            if i % 10 == 0:
-                print(f"  進捗: {i}/{len(product_codes)} 完了")
-
-        print(f"\nすべてのグラフ作成完了: {self.graph_dir}")
-
-        # 全体サマリーを表示
-        overall_accuracy = np.mean([m['accuracy'] for m in accuracy_metrics.values() if not np.isnan(m['accuracy'])])
-        overall_mape = np.mean([m['mape'] for m in accuracy_metrics.values() if not np.isnan(m['mape'])])
-
-        print("\n" + "="*50)
-        print("処理完了サマリー")
-        print("="*50)
-        print(f"処理商品数: {len(product_codes)}")
-        print(f"全体平均精度: {overall_accuracy:.2f}%")
-        print(f"全体平均MAPE: {overall_mape:.2f}%")
-        print(f"グラフ出力先: {self.graph_dir}")
-        print(f"精度サマリー出力先: {self.summary_dir}")
-
-        return accuracy_metrics
+        print("グラフ生成中...")
+        for product_code in pred_df["material_key"].unique():
+            self.create_product_graph(pred_df, product_code, hist_df)
 
 
-def main():
-    """メイン処理"""
-    parser = argparse.ArgumentParser(
-        description='商品レベル予測結果の可視化',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # デフォルト設定で実行
-  python visualize_predictions.py
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
 
-  # 入力ファイルと出力ディレクトリを指定
-  python visualize_predictions.py \\
-    --input /path/to/predictions.csv \\
-    --output /path/to/output
-
-  # 過去データも含めてグラフを作成
-  python visualize_predictions.py \\
-    --input /path/to/predictions.csv \\
-    --output /path/to/output \\
-    --historical /home/ubuntu/yamasa2/work/data/input/df_confirmed_order_input_yamasa_fill_zero.parquet
-        """
-    )
-
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Visualize product-level predictions.")
+    parser.add_argument("--input-file", required=True, help="予測結果ファイル（CSVまたはparquet）")
+    parser.add_argument("--output-dir", required=True, help="出力先ディレクトリ")
+    parser.add_argument("--historical-file", help="過去データparquetファイル（任意）")
     parser.add_argument(
-        '--input',
-        type=str,
-        default='/home/ubuntu/yamasa2/output/confirmed_order_demand_yamasa_predictions_latest_product_key.csv',
-        help='予測結果CSVファイルのパス'
+        "--horizon-months",
+        type=int,
+        default=6,
+        help="グラフで表示する予測期間（月数）。全期間を表示する場合は負値を指定",
     )
-
-    parser.add_argument(
-        '--output',
-        type=str,
-        default='/home/ubuntu/yamasa2/work/visualization',
-        help='出力ディレクトリのパス'
-    )
-
-    parser.add_argument(
-        '--historical',
-        type=str,
-        default='/home/ubuntu/yamasa2/work/data/input/df_confirmed_order_input_yamasa_fill_zero.parquet',
-        help='過去データのparquetファイルパス（商品ごとの全期間表示用）'
-    )
-
     args = parser.parse_args()
 
-    # ファイルの存在確認
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Error: 入力ファイルが見つかりません: {input_path}")
-        return 1
-
-    # Visualizerインスタンス作成
+    horizon = args.horizon_months if args.horizon_months >= 0 else None
     visualizer = PredictionVisualizer(
-        input_file=args.input,
-        output_dir=args.output,
-        historical_data_file=args.historical
+        input_file=args.input_file,
+        output_dir=args.output_dir,
+        historical_data_file=args.historical_file,
+        horizon_months=horizon,
     )
 
-    # 実行
-    try:
-        accuracy_metrics = visualizer.run()
-        print("\n✅ 可視化処理が正常に完了しました")
-        return 0
-    except Exception as e:
-        print(f"\n❌ エラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+    pred_df = visualizer.load_prediction_data()
+    hist_df = visualizer.load_historical_data()
+    visualizer.generate_reports(pred_df, hist_df)
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()

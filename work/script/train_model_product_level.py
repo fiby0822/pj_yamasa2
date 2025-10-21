@@ -1,502 +1,566 @@
 #!/usr/bin/env python3
 """
-Product_keyレベルでのモデル学習・予測スクリプト
-material_key = product_keyとして処理
+商品レベル予測モデル学習・逐次推論スクリプト
+
+ポイント
+--------
+- `generate_features_product_level.py` が作成した逐次更新対応特徴量を読み込み、
+  XGBoost モデルを訓練する。
+- 推論時は `FeatureState` を用いて日次で特徴量を更新しながら前方に予測を進める。
+- 生成した予測値は work/data 以下に保存し、可視化は
+  /home/ubuntu/yamasa2/work/vis_2024-12-31_3 に出力する。
 """
-import sys
-import os
-sys.path.append('/home/ubuntu/yamasa')
 
-import pandas as pd
-import numpy as np
-import argparse
-from datetime import datetime
+from __future__ import annotations
+
 import json
-import gc
-import warnings
-warnings.filterwarnings('ignore')
-from typing import Dict, Optional
+import os
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 
-from modules.models.train_predict import TimeSeriesPredictor
-from modules.evaluation.metrics import ModelEvaluator
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from xgboost import XGBRegressor
+from pandas.tseries.offsets import MonthBegin, MonthEnd
 
-DEFAULT_OPTUNA_TRIALS = 20
-PREDICTION_CLIP_MULTIPLIER = 3.0
-LOW_VOLUME_THRESHOLD = 5000
+from generate_features_product_level import (
+    FEATURE_COLUMNS,
+    FeatureState,
+    MIN_HISTORY,
+    STATIC_INFO_FILENAME,
+    FEATURE_FILENAME_LATEST,
+    load_aggregated_data,
+    ensure_directory,
+)
 
 
-def apply_leak_safe_predictor_patch():
+DEFAULT_BASE_DIR = "/home/ubuntu/yamasa2/work/data"
+DEFAULT_VIS_DIR = "/home/ubuntu/yamasa2/work/vis_2024-12-31_3"
+
+PREDICTIONS_DIRNAME = "predictions"
+MODELS_DIRNAME = "models"
+OUTPUT_DIRNAME = "output"
+EPSILON = 1e-6
+
+
+# --------------------------------------------------------------------------------------
+# ロード系
+# --------------------------------------------------------------------------------------
+
+def load_training_features(base_dir: str) -> pd.DataFrame:
+    path = os.path.join(base_dir, "features", FEATURE_FILENAME_LATEST)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Training feature file not found: {path}")
+    df = pd.read_parquet(path)
+    df["file_date"] = pd.to_datetime(df["file_date"])
+    return df
+
+
+def load_static_info(base_dir: str) -> Dict[str, Dict[str, float]]:
+    path = os.path.join(base_dir, "features", STATIC_INFO_FILENAME)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Static info file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    static_info = {}
+    for material_key, info in data.items():
+        # JSON 上は文字列キーになっている月別統計を int に戻す
+        month_mean_map = {int(k): float(v) for k, v in info.get("month_mean_map", {}).items()}
+        month_std_map = {int(k): float(v) for k, v in info.get("month_std_map", {}).items()}
+
+        static_info[material_key] = {
+            "material_idx": float(info.get("material_idx", 0.0)),
+            "product_mean_f": float(info.get("product_mean_f", 0.0)),
+            "product_std_f": float(info.get("product_std_f", 0.0)),
+            "product_median_f": float(info.get("product_median_f", 0.0)),
+            "product_min_f": float(info.get("product_min_f", 0.0)),
+            "product_max_f": float(info.get("product_max_f", 0.0)),
+            "volume_segment_f": float(info.get("volume_segment_f", 0.0)),
+            "month_mean_map": month_mean_map,
+            "month_std_map": month_std_map,
+        }
+
+    return static_info
+
+
+def ensure_forecast_coverage(
+    aggregated_df: pd.DataFrame,
+    forecast_end: pd.Timestamp,
+) -> pd.DataFrame:
+    """予測対象期間まで日次カレンダーが連続するよう補完する。"""
+
+    frames = []
+    for material_key, group in aggregated_df.groupby("material_key"):
+        group = group.sort_values("file_date")
+        start_date = group["file_date"].min()
+        max_date = max(group["file_date"].max(), forecast_end)
+        full_dates = pd.date_range(start=start_date, end=max_date, freq="D")
+
+        base = pd.DataFrame({"file_date": full_dates})
+        base = base.merge(group[["file_date", "actual_value", "product_key"]], on="file_date", how="left")
+        base["material_key"] = material_key
+        base["product_key"] = base["product_key"].fillna(material_key)
+        base["actual_value"] = base["actual_value"].fillna(0.0)
+
+        frames.append(base[["material_key", "product_key", "file_date", "actual_value"]])
+
+    result = pd.concat(frames, ignore_index=True)
+    result.sort_values(["material_key", "file_date"], inplace=True)
+    return result
+
+
+# --------------------------------------------------------------------------------------
+# 訓練関連
+# --------------------------------------------------------------------------------------
+
+def split_train_validation(
+    features_df: pd.DataFrame,
+    train_end_date: str,
+    validation_days: int = 28,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """時間に従う単純な学習/検証分割。"""
+    cutoff = pd.to_datetime(train_end_date)
+    val_start = cutoff - timedelta(days=validation_days)
+
+    val_mask = features_df["file_date"] >= val_start
+    if val_mask.sum() == 0:
+        # 極端に短い場合は14日で再試行
+        val_start = cutoff - timedelta(days=max(14, validation_days // 2))
+        val_mask = features_df["file_date"] >= val_start
+
+    train_mask = ~val_mask
+    if train_mask.sum() == 0:
+        # 学習データが消えてしまう場合は全データを学習に使用
+        train_mask[:] = True
+        val_mask[:] = False
+
+    train_df = features_df.loc[train_mask].copy()
+    val_df = features_df.loc[val_mask].copy()
+
+    return train_df, val_df
+
+
+def to_matrix(df: pd.DataFrame, feature_cols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    X = df[feature_cols].astype(np.float32).values
+    y = df["actual_value"].astype(np.float32).values
+    return X, y
+
+
+def train_model(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_cols: List[str],
+    random_state: int = 42,
+) -> Tuple[XGBRegressor, Dict[str, float]]:
+    X_train, y_train = to_matrix(train_df, feature_cols)
+    X_val, y_val = to_matrix(val_df, feature_cols) if not val_df.empty else (None, None)
+
+    model = XGBRegressor(
+        n_estimators=800,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        reg_alpha=0.0,
+        objective="reg:squarederror",
+        tree_method="hist",
+        random_state=random_state,
+        n_jobs=-1,
+    )
+
+    if X_val is not None and X_val.size > 0:
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+    else:
+        model.fit(X_train, y_train)
+
+    metrics = {}
+    if X_val is not None and X_val.size > 0:
+        y_pred_val = model.predict(X_val)
+        metrics["val_mae"] = float(mean_absolute_error(y_val, y_pred_val))
+        metrics["val_rmse"] = float(np.sqrt(mean_squared_error(y_val, y_pred_val)))
+        smape = (
+            2 * np.abs(y_pred_val - y_val)
+            / (np.abs(y_pred_val) + np.abs(y_val) + EPSILON)
+        ).mean() * 100
+        wape = np.sum(np.abs(y_pred_val - y_val)) / (np.sum(np.abs(y_val)) + EPSILON)
+        metrics["val_mape"] = float(smape)
+        metrics["val_accuracy"] = float(100 - smape)
+        metrics["val_wape"] = float(wape)
+
+    return model, metrics
+
+
+# --------------------------------------------------------------------------------------
+# 逐次推論
+# --------------------------------------------------------------------------------------
+
+def sequential_forecast(
+    model: XGBRegressor,
+    aggregated_df: pd.DataFrame,
+    static_info_map: Dict[str, Dict[str, float]],
+    train_cutoff_date: pd.Timestamp,
+    forecast_start: pd.Timestamp,
+    forecast_end: pd.Timestamp,
+    feature_cols: List[str],
+) -> pd.DataFrame:
+    predictions: List[Dict[str, float]] = []
+
+    date_range = pd.date_range(start=forecast_start, end=forecast_end, freq="D")
+
+    for material_key, group in aggregated_df.groupby("material_key"):
+        if material_key not in static_info_map:
+            continue
+
+        group = group.sort_values("file_date")
+        static_info = static_info_map[material_key]
+        state = FeatureState(min_history=MIN_HISTORY)
+
+        history_rows = group[group["file_date"] <= train_cutoff_date]
+        if history_rows.empty:
+            continue
+
+        for row in history_rows.itertuples(index=False):
+            state.add_observation(row.file_date, float(row.actual_value))
+
+        actual_series = group.set_index("file_date")["actual_value"]
+
+        for current_date in date_range:
+            feature_row = state.build_feature_row(current_date, static_info)
+            if feature_row is None:
+                y_pred = float(static_info.get("product_mean_f", 0.0))
+            else:
+                vector = np.array([feature_row[col] for col in feature_cols], dtype=np.float32).reshape(1, -1)
+                y_pred = float(model.predict(vector)[0])
+
+            y_pred = max(y_pred, 0.0)
+            actual_value = float(actual_series.get(current_date, 0.0))
+
+            predictions.append(
+                {
+                    "material_key": material_key,
+                    "date": current_date,
+                    "predicted": y_pred,
+                    "actual": actual_value,
+                }
+            )
+
+            state.add_observation(current_date, y_pred)
+
+    pred_df = pd.DataFrame(predictions)
+    if pred_df.empty:
+        raise RuntimeError(
+            "No predictions were generated. Check forecast range or training cut-off date."
+        )
+
+    pred_df.sort_values(["material_key", "date"], inplace=True)
+    return pred_df
+
+
+# --------------------------------------------------------------------------------------
+# 評価・保存
+# --------------------------------------------------------------------------------------
+
+def compute_overall_metrics(pred_df: pd.DataFrame) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    metrics["total_actual"] = float(pred_df["actual"].sum())
+    metrics["total_predicted"] = float(pred_df["predicted"].sum())
+    metrics["mae"] = float(mean_absolute_error(pred_df["actual"], pred_df["predicted"]))
+    metrics["rmse"] = float(np.sqrt(mean_squared_error(pred_df["actual"], pred_df["predicted"])))
+
+    smape = (
+        2 * np.abs(pred_df["predicted"] - pred_df["actual"])
+        / (np.abs(pred_df["predicted"]) + np.abs(pred_df["actual"]) + EPSILON)
+    ).mean() * 100
+    metrics["mape"] = float(smape)
+    metrics["accuracy"] = float(100 - smape)
+    wape = np.sum(np.abs(pred_df["predicted"] - pred_df["actual"])) / (np.sum(np.abs(pred_df["actual"])) + EPSILON)
+    metrics["wape"] = float(wape)
+
+    ratio = metrics["total_predicted"] / metrics["total_actual"] if metrics["total_actual"] > 0 else float("nan")
+    metrics["pred_to_actual_ratio"] = float(ratio)
+
+    return metrics
+
+
+def compute_per_product_metrics(pred_df: pd.DataFrame) -> pd.DataFrame:
+    records = []
+    for material_key, group in pred_df.groupby("material_key"):
+        mae = mean_absolute_error(group["actual"], group["predicted"])
+        rmse = np.sqrt(mean_squared_error(group["actual"], group["predicted"]))
+        actual_sum = group["actual"].sum()
+        predicted_sum = group["predicted"].sum()
+
+        smape = (
+            2 * np.abs(group["predicted"] - group["actual"])
+            / (np.abs(group["predicted"]) + np.abs(group["actual"]) + EPSILON)
+        ).mean() * 100
+        accuracy = 100 - smape
+        wape = np.sum(np.abs(group["predicted"] - group["actual"])) / (np.sum(np.abs(group["actual"])) + EPSILON)
+
+        records.append(
+            {
+                "material_key": material_key,
+                "n_samples": int(len(group)),
+                "actual_sum": float(actual_sum),
+                "predicted_sum": float(predicted_sum),
+                "mae": float(mae),
+                "rmse": float(rmse),
+                "mape": float(smape),
+                "wape": float(wape),
+                "accuracy": float(accuracy),
+            }
+        )
+
+    summary_df = pd.DataFrame(records).sort_values("accuracy", ascending=False)
+    return summary_df
+
+
+def extract_feature_importance(model: XGBRegressor, feature_cols: List[str]) -> pd.DataFrame:
+    booster = model.get_booster()
+    importance = booster.get_score(importance_type="gain")
+    records = [
+        {"feature": feature, "gain": importance.get(feature, 0.0)}
+        for feature in feature_cols
+    ]
+    df = pd.DataFrame(records).sort_values("gain", ascending=False)
+    return df
+
+
+def save_outputs(
+    base_dir: str,
+    train_end_date: str,
+    forecast_start: pd.Timestamp,
+    forecast_end: pd.Timestamp,
+    pred_df: pd.DataFrame,
+    per_product_df: pd.DataFrame,
+    overall_metrics: Dict[str, float],
+    feature_importance_df: pd.DataFrame,
+) -> Dict[str, str]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    predictions_dir = os.path.join(base_dir, PREDICTIONS_DIRNAME)
+    models_dir = os.path.join(base_dir, MODELS_DIRNAME)
+    output_dir = os.path.join(base_dir, OUTPUT_DIRNAME)
+    ensure_directory(predictions_dir)
+    ensure_directory(models_dir)
+    ensure_directory(output_dir)
+
+    # 1. 予測詳細
+    pred_latest = os.path.join(predictions_dir, "product_level_predictions_latest.parquet")
+    pred_dated = os.path.join(predictions_dir, f"product_level_predictions_{timestamp}.parquet")
+    for path in (pred_latest, pred_dated):
+        pred_df.to_parquet(path, index=False)
+
+    pred_csv = os.path.join(output_dir, "product_level_predictions_latest.csv")
+    pred_df.to_csv(pred_csv, index=False)
+
+    # 2. サマリー
+    summary_latest = os.path.join(predictions_dir, "product_level_summary_latest.parquet")
+    summary_dated = os.path.join(predictions_dir, f"product_level_summary_{timestamp}.parquet")
+    for path in (summary_latest, summary_dated):
+        per_product_df.to_parquet(path, index=False)
+
+    summary_csv = os.path.join(output_dir, "product_level_summary_latest.csv")
+    per_product_df.to_csv(summary_csv, index=False)
+
+    # 3. メトリクス
+    metrics_payload = {
+        "timestamp": timestamp,
+        "train_end_date": train_end_date,
+        "forecast_start": forecast_start.strftime("%Y-%m-%d"),
+        "forecast_end": forecast_end.strftime("%Y-%m-%d"),
+        "metrics": overall_metrics,
+    }
+    metrics_latest = os.path.join(models_dir, "product_level_metrics_latest.json")
+    metrics_dated = os.path.join(models_dir, f"product_level_metrics_{timestamp}.json")
+    for path in (metrics_latest, metrics_dated):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(metrics_payload, f, indent=2, ensure_ascii=False)
+
+    # 4. 特徴量重要度
+    fi_latest = os.path.join(models_dir, "feature_importance_latest.csv")
+    fi_dated = os.path.join(models_dir, f"feature_importance_{timestamp}.csv")
+    for path in (fi_latest, fi_dated):
+        feature_importance_df.to_csv(path, index=False)
+
+    return {
+        "predictions_parquet": pred_latest,
+        "predictions_csv": pred_csv,
+        "summary_parquet": summary_latest,
+        "summary_csv": summary_csv,
+        "metrics_json": metrics_latest,
+        "feature_importance_csv": fi_latest,
+    }
+
+
+# --------------------------------------------------------------------------------------
+# 可視化
+# --------------------------------------------------------------------------------------
+
+def run_visualization(
+    predictions_csv: str,
+    output_dir: str,
+    historical_data_path: str,
+    horizon_months: int = 4,
+) -> None:
     """
-    TimeSeriesPredictor の Material Key フィルタリングをリーク防止版に差し替える。
-    未来実績を参照しないよう、train_end_date 以前のデータのみから選別する。
+    PredictionVisualizer を利用してグラフ・サマリを出力する。
     """
-    def _filter_no_leak(
-        self,
-        df: pd.DataFrame,
-        train_end_date: str,
-        target_col: str,
-        step_count: int,
-        verbose: bool = True,
-        min_test_active_records: Optional[int] = None
-    ) -> tuple[pd.DataFrame, set]:
-        train_end = pd.to_datetime(train_end_date)
-        df_train = df[df['date'] <= train_end].copy()
+    from visualize_predictions import PredictionVisualizer
 
-        if verbose:
-            print("\n===== Material Keyフィルタリング（リーク対策版） =====")
-            print(f"フィルタリング対象: {len(df):,}行, Material Keys: {df['material_key'].nunique():,}")
-            print(f"使用データ範囲: ~{train_end.strftime('%Y-%m-%d')} (train)")
-
-        if df_train.empty:
-            if verbose:
-                print("  学習データが空のため、フィルタリングをスキップします。")
-            return df, set(df['material_key'].unique())
-
-        # 学習期間における実績発生数を算出
-        active_train = df_train[df_train[target_col] > 0]
-        history_counts = active_train.groupby('material_key').size()
-
-        top_limit = 7000
-        top_keys = set(history_counts.nlargest(top_limit).index)
-
-        # train_end_date 以前の情報のみで最低活動回数を算出
-        required_history = min_test_active_records if min_test_active_records is not None else step_count * 4
-        if required_history <= 0:
-            required_history = 1
-        history_active_keys = set(history_counts[history_counts >= required_history].index)
-
-        selected_keys = top_keys | history_active_keys
-        if not selected_keys:
-            selected_keys = set(df_train['material_key'].unique())
-
-        df_filtered = df[df['material_key'].isin(selected_keys)].copy()
-
-        if verbose:
-            print(f"  学習期間アクティブ製品: {len(history_counts):,}")
-            print(f"  上位{len(top_keys):,}製品（train実績数ベース）を確保")
-            print(f"  最低活動回数 {required_history} 件以上: {len(history_active_keys):,} 製品")
-            print(f"  選択後: {len(df_filtered):,}行, Material Keys: {df_filtered['material_key'].nunique():,}")
-
-        return df_filtered, set(selected_keys)
-
-    TimeSeriesPredictor._filter_important_material_keys = _filter_no_leak
+    visualizer = PredictionVisualizer(
+        input_file=predictions_csv,
+        output_dir=output_dir,
+        historical_data_file=historical_data_path,
+        horizon_months=horizon_months,
+    )
+    pred_df = visualizer.load_prediction_data()
+    hist_df = visualizer.load_historical_data()
+    visualizer.generate_reports(pred_df, hist_df)
 
 
-def disable_predictor_s3_save():
-    """S3保存を無効化するダミー関数"""
+# --------------------------------------------------------------------------------------
+# メイン
+# --------------------------------------------------------------------------------------
 
-    def _save_model_to_s3_dummy(self, model, params, save_dir=None):
-        print("S3保存をスキップしました（ローカルモード）")
-        return
+def main(
+    base_dir: str = DEFAULT_BASE_DIR,
+    train_end_date: str = "2024-12-31",
+    forecast_month_start: Optional[str] = None,
+    visualization_dir: str = DEFAULT_VIS_DIR,
+    disable_visualization: bool = False,
+) -> None:
+    print("=" * 60)
+    print("Product-level Model Training & Sequential Prediction")
+    print(f"Timestamp         : {datetime.now()}")
+    print(f"Base directory    : {base_dir}")
+    print(f"Train cutoff date : {train_end_date}")
+    print(f"Visualization dir : {visualization_dir}")
+    print("=" * 60)
 
-    TimeSeriesPredictor._save_model_to_s3 = _save_model_to_s3_dummy
+    train_cutoff_dt = pd.to_datetime(train_end_date)
+    if forecast_month_start:
+        forecast_start_dt = pd.to_datetime(forecast_month_start + "-01")
+    else:
+        forecast_start_dt = (train_cutoff_dt + MonthBegin())
+    forecast_end_dt = forecast_start_dt + MonthEnd(0)
 
+    print(f"Forecast month    : {forecast_start_dt.date()} ~ {forecast_end_dt.date()}")
 
-class ProductLevelModelTrainer:
-    """Product_keyレベルでのモデル学習クラス"""
+    features_df = load_training_features(base_dir)
+    features_df = features_df[features_df["file_date"] <= train_cutoff_dt].copy()
+    if features_df.empty:
+        raise ValueError("Training features are empty after applying train cutoff date.")
 
-    def __init__(self, base_dir: str = "/home/ubuntu/yamasa2/work/data"):
-        self.base_dir = base_dir
-        self.prediction_targets: set[str] = set()
-        self.material_baseline = pd.Series(dtype=float)
-        self.volume_segments: Dict[str, str] = {}
+    static_info_map = load_static_info(base_dir)
+    feature_cols = [col for col in FEATURE_COLUMNS if col in features_df.columns]
 
-    def _clip_predictions(self, df_pred: pd.DataFrame) -> pd.DataFrame:
-        """高すぎる予測値を学習期間平均の一定倍数でクリップする"""
-        if df_pred.empty or 'predicted' not in df_pred.columns:
-            return df_pred
+    print(f"Training rows     : {len(features_df):,}")
+    print(f"Feature columns   : {len(feature_cols)} -> {feature_cols}")
 
-        if self.material_baseline.empty:
-            return df_pred
+    train_df, val_df = split_train_validation(features_df, train_cutoff_dt.strftime("%Y-%m-%d"))
+    print(f"Train split       : {len(train_df):,} rows")
+    print(f"Validation split  : {len(val_df):,} rows")
 
-        df_pred = df_pred.copy()
-        baseline = df_pred['material_key'].map(self.material_baseline)
-        cap = baseline * PREDICTION_CLIP_MULTIPLIER
+    model, val_metrics = train_model(train_df, val_df, feature_cols)
+    if val_metrics:
+        print("\nValidation metrics:")
+        for key, value in val_metrics.items():
+            print(f"  {key}: {value:.4f}" if isinstance(value, (int, float)) else f"  {key}: {value}")
 
-        # baseline が存在する場合のみクリップ
-        df_pred['predicted'] = np.where(
-            (~baseline.isna()) & (baseline > 0),
-            np.minimum(df_pred['predicted'], cap),
-            df_pred['predicted']
+    aggregated_df = load_aggregated_data(base_dir)
+    aggregated_df["file_date"] = pd.to_datetime(aggregated_df["file_date"])
+    aggregated_df = ensure_forecast_coverage(aggregated_df, forecast_end_dt)
+
+    pred_df = sequential_forecast(
+        model,
+        aggregated_df,
+        static_info_map,
+        train_cutoff_dt,
+        forecast_start_dt,
+        forecast_end_dt,
+        feature_cols,
+    )
+
+    overall_metrics = compute_overall_metrics(pred_df)
+    per_product_df = compute_per_product_metrics(pred_df)
+    feature_importance_df = extract_feature_importance(model, feature_cols)
+
+    print("\nOverall metrics (sequential forecast):")
+    for key, value in overall_metrics.items():
+        print(f"  {key}: {value:.4f}" if isinstance(value, (int, float)) else f"  {key}: {value}")
+
+    saved_paths = save_outputs(
+        base_dir,
+        train_end_date,
+        forecast_start_dt,
+        forecast_end_dt,
+        pred_df,
+        per_product_df,
+        overall_metrics,
+        feature_importance_df,
+    )
+
+    print("\nSaved artifacts:")
+    for label, path in saved_paths.items():
+        print(f"  {label}: {path}")
+
+    if not disable_visualization:
+        print("\nGenerating visualizations...")
+        ensure_directory(visualization_dir)
+        historical_path = os.path.join(base_dir, "prepared", "df_confirmed_order_input_yamasa_fill_zero.parquet")
+        run_visualization(
+            predictions_csv=saved_paths["predictions_csv"],
+            output_dir=visualization_dir,
+            historical_data_path=historical_path,
         )
+        print(f"Visualizations created in: {visualization_dir}")
 
-        df_pred['predicted'] = np.clip(df_pred['predicted'], a_min=0, a_max=None)
-        return df_pred
-
-    def _augment_metrics(self, df_pred: pd.DataFrame, metrics: Dict) -> Dict:
-        """総量とMAPE指標を追加"""
-        metrics = dict(metrics)
-        if df_pred.empty:
-            return metrics
-
-        actual = df_pred['actual']
-        predicted = df_pred['predicted']
-
-        total_actual = actual.sum()
-        total_predicted = predicted.sum()
-        metrics['total_actual'] = float(total_actual)
-        metrics['total_predicted'] = float(total_predicted)
-        metrics['pred_to_actual_ratio'] = float(total_predicted / total_actual) if total_actual > 0 else np.nan
-
-        mask = actual > 0
-        if mask.any():
-            mape = (np.abs(predicted[mask] - actual[mask]) / actual[mask]).mean() * 100
-            metrics['overall_mape_pct'] = float(mape)
-        else:
-            metrics['overall_mape_pct'] = np.nan
-
-        df_pred = df_pred.copy()
-        df_pred['segment'] = df_pred['material_key'].map(self.volume_segments).fillna('low')
-        for segment in df_pred['segment'].unique():
-            seg_df = df_pred[df_pred['segment'] == segment]
-            if seg_df.empty:
-                continue
-            seg_actual = seg_df['actual']
-            seg_pred = seg_df['predicted']
-            seg_total_actual = seg_actual.sum()
-            seg_total_pred = seg_pred.sum()
-            key = f"{segment}_pred_to_actual_ratio"
-            metrics[key] = float(seg_total_pred / seg_total_actual) if seg_total_actual > 0 else np.nan
-
-        return metrics
-
-    def load_features(self) -> pd.DataFrame:
-        """
-        Product_keyレベルの特徴量データを読み込み
-
-        Returns:
-            pd.DataFrame: 特徴量データ
-        """
-        # work/data/featuresから読み込み
-        local_path = os.path.join(self.base_dir, "features", "product_level_features_latest.parquet")
-        if os.path.exists(local_path):
-            print(f"Loading features from local: {local_path}")
-            df = pd.read_parquet(local_path)
-            print(f"  Loaded {len(df):,} records, {df['material_key'].nunique():,} product keys")
-            return df
-        else:
-            raise FileNotFoundError(f"Product-level features not found: {local_path}")
-
-    def filter_products(
-        self,
-        df: pd.DataFrame,
-        train_end_date: str,
-        step_count: int
-    ) -> pd.DataFrame:
-        """
-        Product_keyのフィルタリング
-        製品レベルなので閾値を調整
-
-        Args:
-            df: 特徴量データ
-            train_end_date: 学習終了日
-            step_count: 予測月数
-
-        Returns:
-            pd.DataFrame: フィルタリング後のデータ
-        """
-        print(f"\n{'='*5} Product Keyフィルタリング {'='*5}")
-
-        df['file_date'] = pd.to_datetime(df['file_date'])
-        train_end = pd.to_datetime(train_end_date)
-
-        # 学習期間のデータのみを利用したフィルタリング
-        df_train = df[df['file_date'] <= train_end].copy()
-        if df_train.empty:
-            print("  学習期間データが存在しないため、フィルタリングをスキップします。")
-            self.prediction_targets = set(df['material_key'].unique())
-            return df
-
-        top_n = 50  # 上位50製品（全98製品の約半分）
-        min_train_count = max(step_count * 10, 1)  # 未来実績を参照せず、train側で最低活動回数を設定
-
-        train_positive = df_train[df_train['actual_value'] > 0]
-        train_counts = train_positive.groupby('material_key').size()
-        top_products_train = set(train_counts.nlargest(top_n).index)
-        active_products_train = set(train_counts[train_counts >= min_train_count].index)
-
-        train_products = top_products_train | active_products_train
-        if not train_products:
-            train_products = set(df_train['material_key'].unique())
-
-        df_filtered = df[df['material_key'].isin(train_products)]
-
-        print(f"\n[フィルタリング結果（trainベース）]")
-        print(f"  製品総数: {df['material_key'].nunique()} → {df_filtered['material_key'].nunique()}")
-        print(f"  - 学習期間Top{top_n}: {len(top_products_train)} products")
-        print(f"  - 学習期間で{min_train_count}件以上の実績: {len(active_products_train)} products")
-        print(f"  - 両条件の和集合: {len(train_products)} products")
-        print(f"  レコード数: {len(df):,} → {len(df_filtered):,}")
-
-        # 予測対象のproduct_keyを記録（学習期間の活動に基づく）
-        self.prediction_targets = train_products
-        train_volume = df_train.groupby('material_key')['actual_value'].sum()
-        self.material_baseline = df_train.groupby('material_key')['actual_value'].mean()
-        self.volume_segments = {
-            mk: ('low' if volume < LOW_VOLUME_THRESHOLD else 'high')
-            for mk, volume in train_volume.items()
-        }
-
-        return df_filtered
-
-    def train_and_evaluate(
-        self,
-        df: pd.DataFrame,
-        train_end_date: str,
-        step_count: int,
-        use_optuna: bool = True,
-        n_trials: int = DEFAULT_OPTUNA_TRIALS
-    ):
-        """
-        モデル学習と評価
-
-        Args:
-            df: フィルタリング済み特徴量データ
-            train_end_date: 学習終了日
-            step_count: 予測月数
-            use_optuna: Optuna使用フラグ
-            n_trials: Optunaの試行回数
-        """
-        print(f"\n{'='*60}")
-        print("Product-level Model Training & Prediction")
-        print(f"{'='*60}")
-
-        # TimeSeriesPredictor のフィルタリングをリーク対策版に差し替え
-        apply_leak_safe_predictor_patch()
-        disable_predictor_s3_save()
-
-        # TimeSeriesPredictorインスタンス作成 (ローカルモード)
-        predictor = TimeSeriesPredictor(
-            bucket_name="dummy-bucket",
-            model_type="product_level"
-        )
-
-        # 特徴量カラムの特定
-        feature_cols = [col for col in df.columns if col.endswith('_f')]
-        print(f"特徴量数: {len(feature_cols)}")
-        print(f"Optuna tuning: {use_optuna} (trials={n_trials if use_optuna else 0})")
-
-        # 学習・予測実行
-        df_train, df_test, df_pred, metrics_dict, model, feature_importance_dict = predictor.train_test_predict_time_split(
-            _df_features=df,
-            train_end_date=train_end_date,
-            step_count=step_count,
-            target_col='actual_value',
-            feature_cols=feature_cols,
-            use_optuna=use_optuna,
-            n_trials=n_trials if use_optuna else 0,
-            use_gpu=False,
-            apply_winsorization=False,
-            apply_hampel=False
-        )
-
-        # 結果を辞書形式に整形
-        # df_testはメトリクス、df_predは特徴量重要度が返される
-        results = {
-            'df_train': df_train,
-            'df_test': df_test,  # メトリクス
-            'df_pred': df_pred,  # 特徴量重要度
-            'model': model,
-            'feature_importance': df_pred,  # df_predが実際には特徴量重要度
-            'metrics': metrics_dict,
-            'best_params': None
-        }
-
-        # 結果の取得
-        df_train = results['df_train']
-        df_test = results['df_test']
-        df_pred = results['df_pred']
-        model = results['model']
-        feature_importance = results['feature_importance']
-        best_params = results.get('best_params')
-
-        df_train = self._clip_predictions(df_train)
-        metrics = self._augment_metrics(df_train, metrics_dict)
-
-        predicted_keys = df_train['material_key'].nunique() if isinstance(df_train, pd.DataFrame) and 'material_key' in df_train.columns else 0
-        total_keys = len(self.prediction_targets) if self.prediction_targets else df['material_key'].nunique()
-        print(f"\nPredictions generated for {predicted_keys} / {total_keys} material_keys.")
-
-        # df_testには実際にはメトリクスが入っている
-        # metrics_dictに全体のメトリクスが含まれている
-        print(f"\n予測対象製品数: {len(self.prediction_targets)}")
-
-        print("\n" + "="*60)
-        print("Product-level Prediction Metrics")
-        print("="*60)
-        for metric_name, value in metrics.items():
-            if isinstance(value, (int, float)):
-                print(f"  {metric_name}: {value:.4f}")
-
-        # Material Key別のサマリーはdf_testにmaterial_key別メトリクスとして含まれている
-        if 'material_key' in df_test.columns:
-            summary = df_test[df_test['material_key'].isin(self.prediction_targets)]
-            print(f"\n製品別サマリー作成完了: {len(summary)} products")
-        else:
-            # material_key別メトリクスがない場合は空のDataFrameを作成
-            summary = pd.DataFrame()
-            print("\n製品別サマリーは利用できません")
-
-        # 結果の保存
-        self.save_results(
-            df_pred=df_train,  # 予測結果がないためdf_trainを代用
-            summary=summary,
-            metrics=metrics,
-            feature_importance=results['feature_importance'],
-            best_params=results.get('best_params'),
-            train_end_date=train_end_date,
-            step_count=step_count
-        )
-
-        return {
-            'metrics': metrics,
-            'summary': summary,
-            'df_pred': df_train,  # 実際の予測データは保存されていないためdf_trainを代用,
-            'model': model,
-            'feature_importance': feature_importance
-        }
-
-    def save_results(
-        self,
-        df_pred: pd.DataFrame,
-        summary: pd.DataFrame,
-        metrics: dict,
-        feature_importance: pd.DataFrame,
-        best_params: dict,
-        train_end_date: str,
-        step_count: int
-    ):
-        """結果をローカルとS3に保存"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        # ローカル保存ディレクトリ
-        os.makedirs('/home/ubuntu/yamasa2/data/predictions', exist_ok=True)
-        os.makedirs('/home/ubuntu/yamasa2/data/models', exist_ok=True)
-
-        # 1. 予測結果の保存
-        pred_path = f"/home/ubuntu/yamasa2/data/predictions/product_level_predictions_{timestamp}.parquet"
-        pred_path_latest = f"/home/ubuntu/yamasa2/data/predictions/product_level_predictions_latest.parquet"
-
-        for path in [pred_path, pred_path_latest]:
-            df_pred.to_parquet(path, index=False)
-            print(f"Saved predictions: {path}")
-
-        # 2. サマリーの保存
-        summary_path = f"/home/ubuntu/yamasa2/data/predictions/product_level_summary_{timestamp}.parquet"
-        summary_path_latest = f"/home/ubuntu/yamasa2/data/predictions/product_level_summary_latest.parquet"
-
-        for path in [summary_path, summary_path_latest]:
-            summary.to_parquet(path, index=False)
-            print(f"Saved summary: {path}")
-
-        # 3. メトリクスの保存
-        metrics_with_info = {
-            'timestamp': timestamp,
-            'train_end_date': train_end_date,
-            'step_count': step_count,
-            'metrics': metrics,
-            'best_params': best_params
-        }
-
-        metrics_path = f"/home/ubuntu/yamasa2/data/models/product_level_metrics_{timestamp}.json"
-        metrics_path_latest = f"/home/ubuntu/yamasa2/data/models/product_level_metrics_latest.json"
-
-        for path in [metrics_path, metrics_path_latest]:
-            with open(path, 'w') as f:
-                json.dump(metrics_with_info, f, indent=2, default=str)
-            print(f"Saved metrics: {path}")
-
-        # 4. 特徴量重要度の保存
-        fi_path = f"/home/ubuntu/yamasa2/data/models/feature_importance_{timestamp}.csv"
-        fi_path_latest = f"/home/ubuntu/yamasa2/data/models/feature_importance_latest.csv"
-
-        for path in [fi_path, fi_path_latest]:
-            feature_importance.to_csv(path, index=False)
-            print(f"Saved feature importance: {path}")
-
-        print("\n" + "="*60)
-        print("Results saved successfully!")
-        print("="*60)
-
-        # S3へのアップロード案内
-        print("\nTo upload to S3, run:")
-        print("python /home/ubuntu/yamasa2/scripts/upload_results_to_s3.py")
-
-
-def main():
-    """メイン処理"""
-    parser = argparse.ArgumentParser(description='Product-level モデル学習・予測')
-
-    parser.add_argument(
-        '--train-end-date',
-        type=str,
-        default='2024-12-31',
-        help='学習データの終了日（YYYY-MM-DD）'
-    )
-    parser.add_argument(
-        '--step-count',
-        type=int,
-        default=1,
-        help='予測月数（デフォルト: 1）'
-    )
-    parser.add_argument(
-        '--disable-optuna',
-        action='store_true',
-        help='Optunaによるハイパーパラメータ探索を無効化'
-    )
-    parser.add_argument(
-        '--n-trials',
-        type=int,
-        default=DEFAULT_OPTUNA_TRIALS,
-        help='Optunaの試行回数'
-    )
-
-    args = parser.parse_args()
-
-    print("="*60)
-    print("Product-level Model Training")
-    print("="*60)
-    print(f"Train end date: {args.train_end_date}")
-    print(f"Step count: {args.step_count}")
-    use_optuna = not args.disable_optuna
-    print(f"Use Optuna: {use_optuna}")
-    if use_optuna:
-        print(f"N trials: {args.n_trials}")
-    print("="*60)
-
-    # トレーナーのインスタンス化
-    trainer = ProductLevelModelTrainer()
-
-    # 特徴量の読み込み
-    print("\nLoading features...")
-    df = trainer.load_features()
-
-    # フィルタリング
-    df_filtered = trainer.filter_products(
-        df,
-        train_end_date=args.train_end_date,
-        step_count=args.step_count
-    )
-
-    # 学習・評価
-    results = trainer.train_and_evaluate(
-        df_filtered,
-        train_end_date=args.train_end_date,
-        step_count=args.step_count,
-        use_optuna=use_optuna,
-        n_trials=args.n_trials
-    )
-
-    print("\n" + "="*60)
-    print("Training completed successfully!")
-    print("="*60)
-    print(f"\nFinal Metrics:")
-    for metric_name, value in results['metrics'].items():
-        if isinstance(value, (int, float)):
-            print(f"  {metric_name}: {value:.4f}")
-        else:
-            print(f"  {metric_name}: {value}")
+    print("\nTraining and forecasting completed successfully.")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train product-level model and generate sequential forecasts.")
+    parser.add_argument(
+        "--base-dir",
+        type=str,
+        default=DEFAULT_BASE_DIR,
+        help=f"データベースディレクトリ (default: {DEFAULT_BASE_DIR})",
+    )
+    parser.add_argument(
+        "--train-end-date",
+        type=str,
+        default="2024-12-31",
+        help="学習データの終了日 (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--forecast-month-start",
+        type=str,
+        default=None,
+        help="予測対象月の開始 (YYYY-MM)。指定しない場合は train_end_date の翌月",
+    )
+    parser.add_argument(
+        "--visualization-dir",
+        type=str,
+        default=DEFAULT_VIS_DIR,
+        help=f"可視化出力先ディレクトリ (default: {DEFAULT_VIS_DIR})",
+    )
+    parser.add_argument(
+        "--disable-visualization",
+        action="store_true",
+        help="可視化生成をスキップする場合に指定",
+    )
+
+    args = parser.parse_args()
+    main(
+        base_dir=args.base_dir,
+        train_end_date=args.train_end_date,
+        forecast_month_start=args.forecast_month_start,
+        visualization_dir=args.visualization_dir,
+        disable_visualization=args.disable_visualization,
+    )

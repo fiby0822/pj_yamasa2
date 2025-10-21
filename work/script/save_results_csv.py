@@ -2,109 +2,98 @@
 """
 Product_keyレベルの結果をyamasaプロジェクトと同じ形式のCSVで保存
 """
-import pandas as pd
-import numpy as np
 import os
 from datetime import datetime
-import json
 
-def create_predictions_csv(base_dir: str = "/home/ubuntu/yamasa2/work/data"):
-    """予測結果CSVの作成"""
-    # サマリーファイルを読み込み（実際の予測結果が含まれる）
+import numpy as np
+import pandas as pd
+
+
+EPSILON = 1e-6
+
+
+def _ensure_output_dir(base_dir: str) -> str:
+    output_dir = os.path.join(base_dir, "output")
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+
+def create_predictions_csv(base_dir: str = "/home/ubuntu/yamasa2/work/data") -> str | None:
+    """予測詳細から集計済みCSVを作成する。"""
+    pred_path = os.path.join(base_dir, "predictions", "product_level_predictions_latest.parquet")
+    if not os.path.exists(pred_path):
+        print(f"Prediction file not found: {pred_path}")
+        return None
+
+    df = pd.read_parquet(pred_path)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+
+    grouped = []
+    for material_key, group in df.groupby("material_key"):
+        actual_sum = float(group["actual"].sum())
+        predicted_sum = float(group["predicted"].sum())
+        mae = float(np.mean(np.abs(group["predicted"] - group["actual"])))
+        rmse = float(np.sqrt(np.mean((group["predicted"] - group["actual"]) ** 2)))
+        smape = float(
+            (
+                2 * np.abs(group["predicted"] - group["actual"])
+                / (np.abs(group["predicted"]) + np.abs(group["actual"]) + EPSILON)
+            ).mean()
+            * 100
+        )
+        accuracy = float(100 - smape)
+        wape = float(np.sum(np.abs(group["predicted"] - group["actual"])) / (np.sum(np.abs(group["actual"])) + EPSILON))
+        grouped.append(
+            {
+                "material_key": material_key,
+                "actual_sum": actual_sum,
+                "predicted_sum": predicted_sum,
+                "mae": mae,
+                "rmse": rmse,
+                "mape": smape,
+                "accuracy": accuracy,
+                "wape": wape,
+                "n_samples": int(len(group)),
+            }
+        )
+
+    df_pred = pd.DataFrame(grouped).sort_values("accuracy", ascending=False)
+    output_dir = _ensure_output_dir(base_dir)
+    csv_path = os.path.join(output_dir, "confirmed_order_demand_yamasa_predictions_latest.csv")
+    df_pred.to_csv(csv_path, index=False)
+    print(f"Saved predictions CSV: {csv_path}")
+    return csv_path
+
+
+def create_material_summary_csv(base_dir: str = "/home/ubuntu/yamasa2/work/data") -> str | None:
+    """既存のサマリーパケットをCSVとして保存する。"""
     summary_path = os.path.join(base_dir, "predictions", "product_level_summary_latest.parquet")
-    if os.path.exists(summary_path):
-        df_summary = pd.read_parquet(summary_path)
-
-        # 必要なカラムだけを抽出してCSV形式に整形
-        df_pred = pd.DataFrame()
-
-        # material_key（product_key）ごとの予測結果を作成
-        if 'material_key' in df_summary.columns:
-            df_pred['material_key'] = df_summary['material_key']
-
-            # 実績値と予測値のカラムを追加（利用可能なものを使用）
-            if 'Mean_Actual' in df_summary.columns:
-                df_pred['actual_sum'] = df_summary['Mean_Actual'] * df_summary.get('count', 31)
-            else:
-                df_pred['actual_sum'] = 0
-
-            if 'Mean_Predicted' in df_summary.columns:
-                df_pred['predicted_sum'] = df_summary['Mean_Predicted'] * df_summary.get('count', 31)
-            else:
-                df_pred['predicted_sum'] = 0
-
-            # その他のメトリクスを追加
-            for col in ['RMSE', 'MAE', 'MAPE', 'Error_Rate_10', 'Error_Rate_20']:
-                if col in df_summary.columns:
-                    df_pred[col] = df_summary[col]
-                else:
-                    df_pred[col] = 0
-        else:
-            # material_key列がない場合はダミーデータを作成
-            df_pred = pd.DataFrame({
-                'material_key': [],
-                'actual_sum': [],
-                'predicted_sum': [],
-                'RMSE': [],
-                'MAE': [],
-                'MAPE': [],
-                'Error_Rate_10': [],
-                'Error_Rate_20': []
-            })
-
-        # CSV保存
-        output_dir = os.path.join(base_dir, "output")
-        csv_path = os.path.join(output_dir, "confirmed_order_demand_yamasa_predictions_latest.csv")
-        os.makedirs(output_dir, exist_ok=True)
-        df_pred.to_csv(csv_path, index=False)
-        print(f"Saved predictions CSV: {csv_path}")
-        return csv_path
-    else:
+    if not os.path.exists(summary_path):
         print(f"Summary file not found: {summary_path}")
         return None
 
-def create_material_summary_csv(base_dir: str = "/home/ubuntu/yamasa2/work/data"):
-    """Material Keyサマリーの作成"""
-    # サマリーファイルを読み込み
-    summary_path = os.path.join(base_dir, "predictions", "product_level_summary_latest.parquet")
-    if os.path.exists(summary_path):
-        df_summary = pd.read_parquet(summary_path)
+    df_summary = pd.read_parquet(summary_path)
+    output_dir = _ensure_output_dir(base_dir)
+    csv_path = os.path.join(output_dir, "confirmed_order_demand_yamasa_material_summary_latest.csv")
+    df_summary.to_csv(csv_path, index=False)
+    print(f"Saved material summary CSV: {csv_path}")
+    return csv_path
 
-        # yamasaプロジェクトと同じ形式にするため、必要なカラムを整形
-        if 'material_key' in df_summary.columns:
-            # すでにサマリー形式なのでそのまま使用
-            df_material_summary = df_summary.copy()
-        else:
-            df_material_summary = pd.DataFrame()
 
-        # CSV保存
-        output_dir = os.path.join(base_dir, "output")
-        csv_path = os.path.join(output_dir, "confirmed_order_demand_yamasa_material_summary_latest.csv")
-        os.makedirs(output_dir, exist_ok=True)
-        df_material_summary.to_csv(csv_path, index=False)
-        print(f"Saved material summary CSV: {csv_path}")
-        return csv_path
-    else:
-        print(f"Summary file not found: {summary_path}")
-        return None
-
-def create_feature_importance_csv(base_dir: str = "/home/ubuntu/yamasa2/work/data"):
-    """特徴量重要度CSVの作成"""
-    # 特徴量重要度ファイルを読み込み
+def create_feature_importance_csv(base_dir: str = "/home/ubuntu/yamasa2/work/data") -> str | None:
+    """特徴量重要度をコピー出力する。"""
     fi_path = os.path.join(base_dir, "models", "feature_importance_latest.csv")
-    if os.path.exists(fi_path):
-        df_fi = pd.read_csv(fi_path)
-
-        # CSV保存（すでにCSVなのでコピー）
-        output_dir = os.path.join(base_dir, "output")
-        csv_path = os.path.join(output_dir, "confirmed_order_demand_yamasa_feature_importance_latest.csv")
-        os.makedirs(output_dir, exist_ok=True)
-        df_fi.to_csv(csv_path, index=False)
-        print(f"Saved feature importance CSV: {csv_path}")
-        return csv_path
-    else:
+    if not os.path.exists(fi_path):
         print(f"Feature importance file not found: {fi_path}")
         return None
+
+    df_fi = pd.read_csv(fi_path)
+    output_dir = _ensure_output_dir(base_dir)
+    csv_path = os.path.join(output_dir, "confirmed_order_demand_yamasa_feature_importance_latest.csv")
+    df_fi.to_csv(csv_path, index=False)
+    print(f"Saved feature importance CSV: {csv_path}")
+    return csv_path
 
 
 def main(base_dir: str = "/home/ubuntu/yamasa2/work/data", train_end_date="2024-12-31", step_count=1):
