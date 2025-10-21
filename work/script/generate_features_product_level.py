@@ -102,10 +102,11 @@ class ProductFeatureGenerator:
 
     def generate_lag_features(self, df: pd.DataFrame, lags: List[int] = None) -> pd.DataFrame:
         """
-        ラグ特徴量を生成
+        ラグ特徴量を生成（データリーク防止版）
+        テストデータには学習期間のデータのみを使用
 
         Args:
-            df: 入力データ
+            df: 入力データ（data_typeカラムが必要）
             lags: ラグのリスト
 
         Returns:
@@ -114,21 +115,54 @@ class ProductFeatureGenerator:
         if lags is None:
             lags = [1, 2, 3, 7, 14, 21, 28]
 
-        print(f"\nGenerating lag features: {lags}")
+        print(f"\nGenerating lag features (NO LEAK): {lags}")
+
+        # data_typeが存在しない場合はエラー
+        if 'data_type' not in df.columns:
+            raise ValueError("data_type column must exist. Run split_train_test first.")
 
         # material_key（product_key）でグループ化
         for lag in lags:
-            print(f"  Creating lag_{lag}...")
-            df[f'lag_{lag}_f'] = df.groupby('material_key')['actual_value'].shift(lag)
+            print(f"  Creating lag_{lag} (leak-free)...")
+
+            # 新しいカラムを初期化
+            df[f'lag_{lag}_f'] = np.nan
+
+            # 各商品ごとに処理
+            for material_key in df['material_key'].unique():
+                material_mask = df['material_key'] == material_key
+                material_df = df[material_mask].copy()
+                material_df = material_df.sort_values('file_date')
+
+                # 学習データのラグ特徴量（通常のshift）
+                train_mask = (material_df['data_type'] == 'train')
+                if train_mask.any():
+                    train_indices = material_df[train_mask].index
+                    df.loc[train_indices, f'lag_{lag}_f'] = material_df[train_mask]['actual_value'].shift(lag).values
+
+                # テストデータのラグ特徴量（学習期間の最後からのみ取得）
+                test_mask = (material_df['data_type'] == 'test')
+                if test_mask.any() and train_mask.any():
+                    test_indices = material_df[test_mask].index
+                    train_values = material_df[train_mask]['actual_value'].values
+                    test_dates = material_df[test_mask]['file_date'].values
+
+                    # テスト期間の各行について、学習期間の最後からlag分前の値を設定
+                    for i, idx in enumerate(test_indices):
+                        # 学習期間の最後からlag分遡った位置
+                        source_position = len(train_values) - lag + i
+                        if source_position >= 0 and source_position < len(train_values):
+                            df.loc[idx, f'lag_{lag}_f'] = train_values[source_position]
 
         return df
 
     def generate_rolling_features(self, df: pd.DataFrame, windows: List[int] = None) -> pd.DataFrame:
         """
-        移動平均・移動標準偏差特徴量を生成
+        移動平均・移動標準偏差特徴量を生成（データリーク防止版）
+        テストデータには学習期間のデータのみを使用
 
         Args:
-            df: 入力データ
+            df: 入力データ（data_typeカラムが必要）
             windows: ウィンドウサイズのリスト
 
         Returns:
@@ -137,30 +171,79 @@ class ProductFeatureGenerator:
         if windows is None:
             windows = [7, 14, 28]
 
-        print(f"\nGenerating rolling features: {windows}")
+        print(f"\nGenerating rolling features (NO LEAK): {windows}")
+
+        # data_typeが存在しない場合はエラー
+        if 'data_type' not in df.columns:
+            raise ValueError("data_type column must exist. Run split_train_test first.")
 
         for window in windows:
-            print(f"  Creating rolling_{window} features...")
+            print(f"  Creating rolling_{window} features (leak-free)...")
 
-            # 移動平均
-            df[f'rolling_mean_{window}_f'] = df.groupby('material_key')['actual_value'].transform(
-                lambda x: x.shift(1).rolling(window=window, min_periods=1).mean()
-            )
+            # 新しいカラムを初期化
+            df[f'rolling_mean_{window}_f'] = np.nan
+            df[f'rolling_std_{window}_f'] = np.nan
+            df[f'rolling_max_{window}_f'] = np.nan
+            df[f'rolling_min_{window}_f'] = np.nan
 
-            # 移動標準偏差
-            df[f'rolling_std_{window}_f'] = df.groupby('material_key')['actual_value'].transform(
-                lambda x: x.shift(1).rolling(window=window, min_periods=1).std()
-            )
+            # 各商品ごとに処理
+            for material_key in df['material_key'].unique():
+                material_mask = df['material_key'] == material_key
+                material_df = df[material_mask].copy()
+                material_df = material_df.sort_values('file_date')
 
-            # 移動最大値
-            df[f'rolling_max_{window}_f'] = df.groupby('material_key')['actual_value'].transform(
-                lambda x: x.shift(1).rolling(window=window, min_periods=1).max()
-            )
+                # 学習データの移動統計特徴量（通常のrolling）
+                train_mask = (material_df['data_type'] == 'train')
+                if train_mask.any():
+                    train_indices = material_df[train_mask].index
+                    train_values = material_df[train_mask]['actual_value'].values
 
-            # 移動最小値
-            df[f'rolling_min_{window}_f'] = df.groupby('material_key')['actual_value'].transform(
-                lambda x: x.shift(1).rolling(window=window, min_periods=1).min()
-            )
+                    # shift(1)を適用してからrollingを計算
+                    shifted_values = pd.Series(train_values).shift(1)
+                    rolling_mean = shifted_values.rolling(window=window, min_periods=1).mean()
+                    rolling_std = shifted_values.rolling(window=window, min_periods=1).std()
+                    rolling_max = shifted_values.rolling(window=window, min_periods=1).max()
+                    rolling_min = shifted_values.rolling(window=window, min_periods=1).min()
+
+                    df.loc[train_indices, f'rolling_mean_{window}_f'] = rolling_mean.values
+                    df.loc[train_indices, f'rolling_std_{window}_f'] = rolling_std.values
+                    df.loc[train_indices, f'rolling_max_{window}_f'] = rolling_max.values
+                    df.loc[train_indices, f'rolling_min_{window}_f'] = rolling_min.values
+
+                # テストデータの移動統計特徴量（学習期間の最後のwindow分のデータを使用）
+                test_mask = (material_df['data_type'] == 'test')
+                if test_mask.any() and train_mask.any():
+                    test_indices = material_df[test_mask].index
+                    train_values = material_df[train_mask]['actual_value'].values
+
+                    # 学習期間最後のwindow分のデータで統計量を計算
+                    if len(train_values) >= window:
+                        # 学習期間最後のwindow分のデータ
+                        last_window_values = train_values[-window:]
+
+                        # テスト期間のすべての行に同じ値を設定
+                        # (テスト期間内では更新されない）
+                        test_mean = np.mean(last_window_values)
+                        test_std = np.std(last_window_values)
+                        test_max = np.max(last_window_values)
+                        test_min = np.min(last_window_values)
+
+                        df.loc[test_indices, f'rolling_mean_{window}_f'] = test_mean
+                        df.loc[test_indices, f'rolling_std_{window}_f'] = test_std
+                        df.loc[test_indices, f'rolling_max_{window}_f'] = test_max
+                        df.loc[test_indices, f'rolling_min_{window}_f'] = test_min
+                    else:
+                        # ウィンドウサイズに満たない場合は、利用可能なデータで計算
+                        if len(train_values) > 0:
+                            test_mean = np.mean(train_values)
+                            test_std = np.std(train_values) if len(train_values) > 1 else 0
+                            test_max = np.max(train_values)
+                            test_min = np.min(train_values)
+
+                            df.loc[test_indices, f'rolling_mean_{window}_f'] = test_mean
+                            df.loc[test_indices, f'rolling_std_{window}_f'] = test_std
+                            df.loc[test_indices, f'rolling_max_{window}_f'] = test_max
+                            df.loc[test_indices, f'rolling_min_{window}_f'] = test_min
 
         return df
 
@@ -176,41 +259,81 @@ class ProductFeatureGenerator:
         """
         print("\nGenerating product profile features...")
 
-        # 各商品の全期間統計（学習データのみから計算すべき）
-        product_stats = df.groupby('material_key')['actual_value'].agg([
+        # 学習データのみから統計量を計算（データリーク防止）
+        train_df = df[df['data_type'] == 'train']
+        product_stats = train_df.groupby('material_key')['actual_value'].agg([
             'mean', 'std', 'median', 'min', 'max'
         ]).reset_index()
 
         product_stats.columns = ['material_key'] + [f'product_{col}_f' for col in product_stats.columns[1:]]
 
-        # マージ
+        # 全データ（train+test）にマージ
         df = pd.merge(df, product_stats, on='material_key', how='left')
 
-        print(f"Added product profile features")
+        print(f"Added product profile features (calculated from {len(train_df)} train records)")
 
         return df
 
     def generate_trend_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        トレンド特徴量を生成
+        トレンド特徴量を生成（データリーク防止版）
 
         Args:
-            df: 入力データ
+            df: 入力データ（data_typeカラムが必要）
 
         Returns:
             トレンド特徴量を追加したデータ
         """
-        print("\nGenerating trend features...")
+        print("\nGenerating trend features (NO LEAK)...")
 
-        # 7日前からの変化率
-        df['trend_7d_f'] = df.groupby('material_key').apply(
-            lambda x: (x['actual_value'] - x['actual_value'].shift(7)) / (x['actual_value'].shift(7) + 1)
-        ).reset_index(level=0, drop=True)
+        # data_typeが存在しない場合はエラー
+        if 'data_type' not in df.columns:
+            raise ValueError("data_type column must exist. Run split_train_test first.")
 
-        # 28日前からの変化率
-        df['trend_28d_f'] = df.groupby('material_key').apply(
-            lambda x: (x['actual_value'] - x['actual_value'].shift(28)) / (x['actual_value'].shift(28) + 1)
-        ).reset_index(level=0, drop=True)
+        # 新しいカラムを初期化
+        df['trend_7d_f'] = np.nan
+        df['trend_28d_f'] = np.nan
+
+        # 各商品ごとに処理
+        for material_key in df['material_key'].unique():
+            material_mask = df['material_key'] == material_key
+            material_df = df[material_mask].copy()
+            material_df = material_df.sort_values('file_date')
+
+            # 学習データのトレンド特徴量
+            train_mask = (material_df['data_type'] == 'train')
+            if train_mask.any():
+                train_indices = material_df[train_mask].index
+                train_values = material_df[train_mask]['actual_value'].values
+
+                # 7日前からの変化率
+                trend_7d = pd.Series(train_values).pct_change(7).fillna(0).values
+                df.loc[train_indices, 'trend_7d_f'] = trend_7d
+
+                # 28日前からの変化率
+                trend_28d = pd.Series(train_values).pct_change(28).fillna(0).values
+                df.loc[train_indices, 'trend_28d_f'] = trend_28d
+
+            # テストデータのトレンド特徴量（学習期間最後の値から計算）
+            test_mask = (material_df['data_type'] == 'test')
+            if test_mask.any() and train_mask.any():
+                test_indices = material_df[test_mask].index
+                train_values = material_df[train_mask]['actual_value'].values
+
+                # 学習期間最後の7日間と28日間のトレンドを計算
+                if len(train_values) >= 28:
+                    # 7日前からの変化率
+                    trend_7d_value = (train_values[-1] - train_values[-8]) / (train_values[-8] + 1) if len(train_values) >= 8 else 0
+                    # 28日前からの変化率
+                    trend_28d_value = (train_values[-1] - train_values[-29]) / (train_values[-29] + 1)
+
+                    # テスト期間のすべての行に同じ値を設定
+                    df.loc[test_indices, 'trend_7d_f'] = trend_7d_value
+                    df.loc[test_indices, 'trend_28d_f'] = trend_28d_value
+                elif len(train_values) > 0:
+                    # データが不足している場合は0を設定
+                    df.loc[test_indices, 'trend_7d_f'] = 0
+                    df.loc[test_indices, 'trend_28d_f'] = 0
 
         return df
 
@@ -221,30 +344,30 @@ class ProductFeatureGenerator:
         print("\nGenerating day-of-week features...")
 
         # material_dow_mean_f: Material Key×曜日の過去平均
-        self._create_entity_dow_mean(df, 'material_key', 'material_dow_mean_f')
+        df = self._create_entity_dow_mean(df, 'material_key', 'material_dow_mean_f')
 
         # store_code_dow_mean_f: Store Code×曜日の過去平均
         if 'store_code' in df.columns:
-            self._create_entity_dow_mean(df, 'store_code', 'store_code_dow_mean_f')
+            df = self._create_entity_dow_mean(df, 'store_code', 'store_code_dow_mean_f')
         else:
             print("Warning: store_code column not found, skipping store_code_dow_mean_f")
 
         print("Day-of-week features completed")
         return df
 
-    def _create_entity_dow_mean(self, df: pd.DataFrame, entity_col: str, feature_name: str) -> None:
-        """エンティティ×曜日の過去平均を計算"""
+    def _create_entity_dow_mean(self, df: pd.DataFrame, entity_col: str, feature_name: str) -> pd.DataFrame:
+        """エンティティ×曜日の過去平均を計算（学習データのみ使用）"""
         print(f"  Creating {feature_name}...")
 
-        # エンティティ×曜日でグループ化して累積平均を計算
-        df.sort_values([entity_col, 'file_date'], inplace=True)
+        # 学習データから統計を計算
+        train_df = df[df['data_type'] == 'train']
+        dow_stats = train_df.groupby([entity_col, 'day_of_week_f'])['actual_value'].mean().reset_index()
+        dow_stats.columns = [entity_col, 'day_of_week_f', feature_name]
 
-        # 累積平均を計算（現在の値を除外）
-        df[feature_name] = (
-            df.groupby([entity_col, 'day_of_week_f'])['actual_value']
-            .transform(lambda x: x.expanding(min_periods=1).mean().shift(1))
-            .astype("float32")
-        )
+        # 全データにマージ
+        df = pd.merge(df, dow_stats, on=[entity_col, 'day_of_week_f'], how='left')
+
+        return df
 
     def split_train_test(self, df: pd.DataFrame, train_end_date: str) -> pd.DataFrame:
         """
@@ -292,41 +415,50 @@ class ProductFeatureGenerator:
 
         print(f"\nSaved successfully: {len(df)} rows, {df.shape[1]} columns")
 
-    def run(self, train_end_date: str = "2024-12-31"):
+    def run(self, train_end_date: str = "2024-12-31", step_count: int = 1):
         """
-        メイン処理
+        メイン処理（データリーク防止版）
 
         Args:
             train_end_date: 学習データの終了日
+            step_count: 予測月数
         """
         print("="*60)
-        print("Product-level Feature Generation")
+        print("Product-level Feature Generation (No Data Leakage Version)")
         print(f"Timestamp: {datetime.now()}")
+        print(f"Parameters: train_end_date={train_end_date}, step_count={step_count}")
         print("="*60)
 
         # 1. データ読み込み
         df = self.load_data()
 
-        # 2. 基本特徴量
+        # 2. データ分割（最初に実行：データリーク防止の核心）
+        df = self.split_train_test(df, train_end_date)
+
+        # 統計情報の表示
+        train_size = (df['data_type'] == 'train').sum()
+        test_size = (df['data_type'] == 'test').sum()
+        print(f"\nData split completed:")
+        print(f"  Train: {train_size:,} records (~{train_end_date})")
+        print(f"  Test:  {test_size:,} records ({train_end_date}~)")
+
+        # 3. 基本特徴量
         df = self.generate_basic_features(df)
 
-        # 3. ラグ特徴量
+        # 4. ラグ特徴量
         df = self.generate_lag_features(df)
 
-        # 4. 移動統計特徴量
+        # 5. 移動統計特徴量
         df = self.generate_rolling_features(df)
 
-        # 5. 商品プロファイル特徴量
+        # 6. 商品プロファイル特徴量（学習データのみから統計を計算）
         df = self.generate_product_profile_features(df)
 
-        # 6. トレンド特徴量
+        # 7. トレンド特徴量
         df = self.generate_trend_features(df)
 
-        # 7. 曜日別特徴量
+        # 8. 曜日別特徴量（学習データのみから統計を計算）
         df = self.generate_dow_features(df)
-
-        # 8. 学習/テスト分割
-        df = self.split_train_test(df, train_end_date)
 
         # 9. 保存
         self.save_features(df)
@@ -345,8 +477,25 @@ class ProductFeatureGenerator:
 
 def main():
     """メイン処理"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='商品レベル特徴量生成')
+    parser.add_argument(
+        '--train_end_date',
+        type=str,
+        default='2024-12-31',
+        help='学習データの終了日 (YYYY-MM-DD形式、デフォルト: 2024-12-31)'
+    )
+    parser.add_argument(
+        '--step_count',
+        type=int,
+        default=1,
+        help='予測月数 (デフォルト: 1)'
+    )
+    args = parser.parse_args()
+
     generator = ProductFeatureGenerator()
-    df = generator.run(train_end_date="2024-12-31")
+    df = generator.run(train_end_date=args.train_end_date, step_count=args.step_count)
 
     # 特徴量の統計情報
     print("\nFeature statistics:")

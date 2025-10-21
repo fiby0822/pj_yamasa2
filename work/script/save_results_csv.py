@@ -107,11 +107,12 @@ def create_feature_importance_csv(base_dir: str = "/home/ubuntu/yamasa2/work/dat
         return None
 
 
-def main(base_dir: str = "/home/ubuntu/yamasa2/work/data"):
+def main(base_dir: str = "/home/ubuntu/yamasa2/work/data", train_end_date="2024-12-31", step_count=1):
     """メイン処理"""
     print("="*60)
     print("Creating CSV files for Product-level results")
     print(f"Timestamp: {datetime.now()}")
+    print(f"Parameters: train_end_date={train_end_date}, step_count={step_count}")
     print("="*60)
 
     # 各CSVファイルを作成
@@ -132,4 +133,27 @@ def main(base_dir: str = "/home/ubuntu/yamasa2/work/data"):
     print(f"  {os.path.join(output_dir, 'confirmed_order_demand_yamasa_feature_importance_latest.csv')}")
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Creating CSV files for Product-level results')
+    parser.add_argument(
+        '--base_dir',
+        type=str,
+        default='/home/ubuntu/yamasa2/work/data',
+        help='データディレクトリのパス (デフォルト: /home/ubuntu/yamasa2/work/data)'
+    )
+    parser.add_argument(
+        '--train_end_date',
+        type=str,
+        default='2024-12-31',
+        help='学習データの終了日 (YYYY-MM-DD形式、デフォルト: 2024-12-31)'
+    )
+    parser.add_argument(
+        '--step_count',
+        type=int,
+        default=1,
+        help='予測月数 (デフォルト: 1)'
+    )
+    args = parser.parse_args()
+
+    main(base_dir=args.base_dir, train_end_date=args.train_end_date, step_count=args.step_count)

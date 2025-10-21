@@ -284,10 +284,11 @@ class ProductLevelTrainer:
         print(f"Saved parameters: {params_path}")
 
 
-def main():
+def main(train_end_date="2024-12-31", step_count=1):
     print("="*60)
     print("Product-level Training with Yamasa-compatible Output")
     print(f"Timestamp: {datetime.now()}")
+    print(f"Parameters: train_end_date={train_end_date}, step_count={step_count}")
     print("="*60)
 
     trainer = ProductLevelTrainer()
@@ -298,7 +299,7 @@ def main():
 
     # 2. 学習・予測
     print("\nStep 2: Training model...")
-    results = trainer.train_and_predict(df, train_end_date="2024-12-31", step_count=1)
+    results = trainer.train_and_predict(df, train_end_date=train_end_date, step_count=step_count)
 
     # 3. 日次予測データ作成
     print("\nStep 3: Creating daily predictions...")
@@ -336,4 +337,21 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Product-level Training with Yamasa-compatible Output')
+    parser.add_argument(
+        '--train_end_date',
+        type=str,
+        default='2024-12-31',
+        help='学習データの終了日 (YYYY-MM-DD形式、デフォルト: 2024-12-31)'
+    )
+    parser.add_argument(
+        '--step_count',
+        type=int,
+        default=1,
+        help='予測月数 (デフォルト: 1)'
+    )
+    args = parser.parse_args()
+
+    main(train_end_date=args.train_end_date, step_count=args.step_count)
