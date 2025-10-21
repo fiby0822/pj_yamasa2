@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from typing import Optional
 
 from generate_features_product_level import main as generate_features_main
 from train_model_product_level import main as train_model_main
@@ -25,6 +26,7 @@ def main(
     base_dir: str,
     train_end_date: str,
     forecast_month_start: str,
+    forecast_month_end: Optional[str],
     visualization_dir: str,
     skip_features: bool,
 ) -> None:
@@ -34,7 +36,8 @@ def main(
     print(f"Base directory   : {base_dir}")
     print(f"Train end date   : {train_end_date}")
     print(f"Visualization dir: {visualization_dir}")
-    print(f"Forecast month start: {forecast_month_start if forecast_month_start else 'auto (next month)'}")
+    print(f"Forecast start month: {forecast_month_start if forecast_month_start else 'auto (next month)'}")
+    print(f"Forecast end month  : {forecast_month_end if forecast_month_end else 'same as start'}")
     print("=" * 60)
 
     if not skip_features:
@@ -48,6 +51,7 @@ def main(
         base_dir=base_dir,
         train_end_date=train_end_date,
         forecast_month_start=forecast_month_start,
+        forecast_month_end=forecast_month_end,
         visualization_dir=visualization_dir,
         disable_visualization=False,
     )
@@ -85,6 +89,12 @@ if __name__ == "__main__":
         help="予測対象月の開始 (YYYY-MM)。未指定の場合は train_end_date の翌月",
     )
     parser.add_argument(
+        "--forecast-month-end",
+        type=str,
+        default=None,
+        help="予測対象月の終了 (YYYY-MM)。未指定の場合は開始月のみ",
+    )
+    parser.add_argument(
         "--skip-features",
         action="store_true",
         help="既存の特徴量ファイルを再利用する場合に指定",
@@ -95,6 +105,7 @@ if __name__ == "__main__":
         base_dir=args.base_dir,
         train_end_date=args.train_end_date,
         forecast_month_start=args.forecast_month_start,
+        forecast_month_end=args.forecast_month_end,
         visualization_dir=args.visualization_dir,
         skip_features=args.skip_features,
     )

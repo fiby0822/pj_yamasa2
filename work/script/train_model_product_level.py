@@ -44,6 +44,16 @@ OUTPUT_DIRNAME = "output"
 EPSILON = 1e-6
 
 
+def _parse_month(month_str: str) -> pd.Timestamp:
+    if month_str is None:
+        raise ValueError("Month string must not be None.")
+    return pd.to_datetime(f"{month_str}-01")
+
+
+def _compute_horizon_months(start: pd.Timestamp, end: pd.Timestamp) -> int:
+    return (end.year - start.year) * 12 + (end.month - start.month) + 1
+
+
 # --------------------------------------------------------------------------------------
 # ロード系
 # --------------------------------------------------------------------------------------
@@ -405,6 +415,7 @@ def run_visualization(
     output_dir: str,
     historical_data_path: str,
     horizon_months: int = 4,
+    history_months: int = 3,
 ) -> None:
     """
     PredictionVisualizer を利用してグラフ・サマリを出力する。
@@ -416,6 +427,7 @@ def run_visualization(
         output_dir=output_dir,
         historical_data_file=historical_data_path,
         horizon_months=horizon_months,
+        history_months=history_months,
     )
     pred_df = visualizer.load_prediction_data()
     hist_df = visualizer.load_historical_data()
@@ -430,6 +442,7 @@ def main(
     base_dir: str = DEFAULT_BASE_DIR,
     train_end_date: str = "2024-12-31",
     forecast_month_start: Optional[str] = None,
+    forecast_month_end: Optional[str] = None,
     visualization_dir: str = DEFAULT_VIS_DIR,
     disable_visualization: bool = False,
 ) -> None:
@@ -443,10 +456,17 @@ def main(
 
     train_cutoff_dt = pd.to_datetime(train_end_date)
     if forecast_month_start:
-        forecast_start_dt = pd.to_datetime(forecast_month_start + "-01")
+        forecast_start_dt = _parse_month(forecast_month_start)
     else:
         forecast_start_dt = (train_cutoff_dt + MonthBegin())
-    forecast_end_dt = forecast_start_dt + MonthEnd(0)
+
+    if forecast_month_end:
+        forecast_end_dt = _parse_month(forecast_month_end) + MonthEnd(0)
+    else:
+        forecast_end_dt = forecast_start_dt + MonthEnd(0)
+
+    if forecast_end_dt < forecast_start_dt:
+        raise ValueError("forecast_month_end must not be earlier than forecast_month_start.")
 
     print(f"Forecast month    : {forecast_start_dt.date()} ~ {forecast_end_dt.date()}")
 
@@ -509,6 +529,7 @@ def main(
         print(f"  {label}: {path}")
 
     if not disable_visualization:
+        horizon_months = _compute_horizon_months(forecast_start_dt, forecast_end_dt)
         print("\nGenerating visualizations...")
         ensure_directory(visualization_dir)
         historical_path = os.path.join(base_dir, "prepared", "df_confirmed_order_input_yamasa_fill_zero.parquet")
@@ -516,6 +537,8 @@ def main(
             predictions_csv=saved_paths["predictions_csv"],
             output_dir=visualization_dir,
             historical_data_path=historical_path,
+            horizon_months=horizon_months,
+            history_months=3,
         )
         print(f"Visualizations created in: {visualization_dir}")
 
@@ -545,6 +568,12 @@ if __name__ == "__main__":
         help="予測対象月の開始 (YYYY-MM)。指定しない場合は train_end_date の翌月",
     )
     parser.add_argument(
+        "--forecast-month-end",
+        type=str,
+        default=None,
+        help="予測対象月の終了 (YYYY-MM)。指定しない場合は開始月のみを予測",
+    )
+    parser.add_argument(
         "--visualization-dir",
         type=str,
         default=DEFAULT_VIS_DIR,
@@ -561,6 +590,7 @@ if __name__ == "__main__":
         base_dir=args.base_dir,
         train_end_date=args.train_end_date,
         forecast_month_start=args.forecast_month_start,
+        forecast_month_end=args.forecast_month_end,
         visualization_dir=args.visualization_dir,
         disable_visualization=args.disable_visualization,
     )
