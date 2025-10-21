@@ -11,6 +11,7 @@ from io import BytesIO
 import gc
 import os
 from typing import List, Dict, Tuple
+import jpholiday
 
 class ProductFeatureGenerator:
     def __init__(self, s3_bucket: str = "fiby-yamasa-prediction-2"):
@@ -61,6 +62,36 @@ class ProductFeatureGenerator:
         df['dow'] = df['file_date'].dt.dayofweek
         df['is_weekend'] = (df['dow'] >= 5).astype(int)
 
+        # day_of_week_f: カテゴリカル変数として曜日（1=月曜日、土日はnull）
+        def get_weekday_business(date):
+            """営業日の曜日を取得（1=月曜日、土日はnull）"""
+            if pd.isna(date):
+                return np.nan
+            weekday = date.weekday()  # 0=月曜日
+            if weekday >= 5:  # 土日
+                return np.nan
+            return weekday + 1  # 1=月曜日に変換
+
+        df["day_of_week_f"] = df['file_date'].apply(get_weekday_business).astype("float32")
+
+        # is_business_day_f: 営業日フラグ（拡張祝日判定）
+        def is_business_day(date):
+            """営業日判定（土日祝日以外）"""
+            if pd.isna(date):
+                return np.nan
+            # 土日判定
+            if date.weekday() >= 5:  # 5=土曜, 6=日曜
+                return 0
+            # 祝日判定
+            if jpholiday.is_holiday(date):
+                return 0
+            # 年末年始判定（1/1~1/5と12/30~12/31）
+            if (date.month == 1 and date.day <= 5) or (date.month == 12 and date.day >= 30):
+                return 0
+            return 1
+
+        df['is_business_day_f'] = df['file_date'].apply(is_business_day).astype("int8")
+
         # 月・四半期特徴量
         df['month'] = df['file_date'].dt.month
         df['quarter'] = df['file_date'].dt.quarter
@@ -70,7 +101,7 @@ class ProductFeatureGenerator:
         df['is_month_start'] = (df['file_date'].dt.day <= 7).astype(int)
         df['is_month_end'] = (df['file_date'].dt.day >= 24).astype(int)
 
-        print(f"Added basic features: dow, is_weekend, month, quarter, year, is_month_start, is_month_end")
+        print(f"Added basic features: dow, is_weekend, day_of_week_f, is_business_day_f, month, quarter, year, is_month_start, is_month_end")
 
         return df
 
@@ -188,6 +219,38 @@ class ProductFeatureGenerator:
 
         return df
 
+    def generate_dow_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        曜日別の特徴量を生成
+        """
+        print("\nGenerating day-of-week features...")
+
+        # material_dow_mean_f: Material Key×曜日の過去平均
+        self._create_entity_dow_mean(df, 'material_key', 'material_dow_mean_f')
+
+        # store_code_dow_mean_f: Store Code×曜日の過去平均
+        if 'store_code' in df.columns:
+            self._create_entity_dow_mean(df, 'store_code', 'store_code_dow_mean_f')
+        else:
+            print("Warning: store_code column not found, skipping store_code_dow_mean_f")
+
+        print("Day-of-week features completed")
+        return df
+
+    def _create_entity_dow_mean(self, df: pd.DataFrame, entity_col: str, feature_name: str) -> None:
+        """エンティティ×曜日の過去平均を計算"""
+        print(f"  Creating {feature_name}...")
+
+        # エンティティ×曜日でグループ化して累積平均を計算
+        df.sort_values([entity_col, 'file_date'], inplace=True)
+
+        # 累積平均を計算（現在の値を除外）
+        df[feature_name] = (
+            df.groupby([entity_col, 'day_of_week_f'])['actual_value']
+            .transform(lambda x: x.expanding(min_periods=1).mean().shift(1))
+            .astype("float32")
+        )
+
     def split_train_test(self, df: pd.DataFrame, train_end_date: str) -> pd.DataFrame:
         """
         学習データとテストデータを分割
@@ -266,10 +329,13 @@ class ProductFeatureGenerator:
         # 6. トレンド特徴量
         df = self.generate_trend_features(df)
 
-        # 7. 学習/テスト分割
+        # 7. 曜日別特徴量
+        df = self.generate_dow_features(df)
+
+        # 8. 学習/テスト分割
         df = self.split_train_test(df, train_end_date)
 
-        # 8. 保存
+        # 9. 保存
         self.save_features(df)
 
         # サマリー
