@@ -1,0 +1,40 @@
+【目的】
+imp1で追加した頻度・季節特徴により希少需要SKUは改善した一方、主要高ボリュームSKUでaccuracyが大幅悪化し、総量比が1.61まで悪化した。imp2では「高頻度SKUへの過剰適用を避ける」「実績ベースのバイアス補正」を柱に、特徴量設計とロジックを再構築する。
+
+【改修要件（imp2）】
+1. 高頻度SKU向けの頻度特徴ガード
+   - `generate_features_product_level.py` において、`volume_segment_f` や非ゼロ比率を用いたゲーティング特徴を追加し、zero run系指標が高頻度SKUで強く効き過ぎることを抑制する。
+     - 追加列: `high_frequency_flag_f`（直近28日の非ゼロ比率>0.8 かつ volume_segment=1）。
+     - zero系指標と掛け合わせた `high_freq_zero_penalty_f = high_frequency_flag_f * zero_run_length_7_f` 等を導入し、モデルが「高頻度SKUでは zero_run_length を縮退させる」ことを学習できるようにする。
+   - `weekend_zero_flag_f` / `weekend_nonzero_rate_f` は観測土日件数<6の場合はNa扱いにし、`weekend_support_count_f` を別列で保持してサンプル不足を明示する。
+
+2. 実績ベースのバイアスモニタリングへ差し替え
+   - 推論時に予測しか存在しない問題を避けるため、`cumulative_pred_to_actual_ratio_f` / `recent_bias_ratio_14_f` を廃止し、学習データから算出可能な実績比に置換。
+     - 追加列: `recent_actual_to_seasonal_ratio_14_f`（直近14日の実績平均 ÷ 月季節平均）、`recent_actual_vs_weekday_mean_f`（直近14日実績÷過去180日の同曜日平均）。
+   - これら新指標で過大予測時に「実績側の落ち込み」を検知し、予測値を収束方向に導く。
+
+3. レベルシフト検知の強化
+   - `short_long_mean_gap_f = rolling_mean_7_f / (rolling_mean_28_f + 1e-6)` を追加し、直近平均が長期平均を大きく上回る状況を特徴量化。
+   - `weekday_level_diff_f_{0..6}`（同曜日の直近4週平均 ÷ 全体平均）を算出し、曜日別の偏りが急変しているかを示す。
+   - 期待効果: imp1で悪化したA030830等の「恒常的に動くSKU」で過剰な伸長をフラグし、モデルが抑制的に学習する。
+
+4. ゼロ需要確率の明示的特徴化
+   - `recent_zero_share_28_f`（過去28日のゼロ発生比）と `weekday_zero_share_f_{0..6}` を実績のみで算出。
+   - これらを `FeatureState` に保持し、zero runと合わせて学習に供給することで、ゼロ日を持つSKUと持たないSKUを明確に分離。
+   - 将来の二段モデル導入を見据え、`generate_features_product_level.py` から `is_nonzero` を出力し `train_model_product_level.py` での利用余地を確保する（imp2で分類器導入までは行わず、特徴整備まで）。
+
+5. 週次季節特徴の再スケーリング
+   - `seasonal_week_mean_f` / `seasonal_week_std_f` を volumeセグメント毎に正規化し、極端な値をクリップする（例: 1%〜99%分位でwinsorize）。
+   - 大幅悪化したSKU向けに `seasonal_week_gap_f = rolling_mean_7_f / (seasonal_week_mean_f + 1e-6)` を追加し、週次季節値との乖離を直接学習させる。
+
+6. 予測総量の安全弁
+   - `FeatureState` に `recent_actual_cumsum_28_f`（過去28日の累積実績）と `recent_peak_actual_f` を保持。
+   - 推論時、`train_model_product_level.py` で `y_pred` が `recent_peak_actual_f * 1.5` を超えた場合はソフトクリップを適用（tanhベースなど）。閾値は設定ファイル化して検証しやすくする。
+
+7. モニタリング指標の整備
+   - `work/script/tmp` 向けに、`high_frequency_flag_f` や `short_long_mean_gap_f` の分布を出力する集計スクリプトを追加し、imp2導入後の影響を定期的に照査できるようにする。
+   - 予測/実績比について、SKU毎に `ratio_flag`（>1.5 など）を付与し可視化レポートに連携する。
+
+【フォローアップ】
+- imp2実装後は、imp1で大幅悪化したトップSKU（A030830, A016010, A162840, A126760, A131700）を対象に個別モニタリングを実施し、特に`short_long_mean_gap_f`や`seasonal_week_gap_f` の寄与を確認する。
+- 需給希少SKUでは既存run length特徴を維持しつつ、分類器導入の検証（is_nonzero予測）を次フェーズ候補として準備する。

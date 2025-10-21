@@ -1,0 +1,33 @@
+【目的】
+2025年1-3月の予測結果で顕在化した「ゼロ需要日の多さ」「過大予測」に対し、`work/script/generate_features_product_level.py` で生成する特徴量を強化し、需要発生頻度と規模の予測精度を底上げする。
+
+【特徴量開発に関する改修要件】
+1. 需要発生頻度の精緻化
+   - 追加特徴量: `recent_nonzero_run_length_7_f` / `recent_nonzero_run_length_14_f`（直近で連続して需要が発生している日数）、`zero_run_length_7_f` / `zero_run_length_14_f`（連続ゼロ日数）、`dow_nonzero_rate_f_{0..6}`（曜日別非ゼロ率）。
+   - 実装箇所: `FeatureState` に連続ゼロ/非ゼロの履歴管理を追加し、`generate_features_product_level.py` で日毎に算出。
+   - 期待効果: accuracyと強い負相関を持つゼロ比率をより精密に捉え、需要発生確率モデルや閾値調整に活かすことで過大予測の抑制を図る。
+   - 追加要件: 土日で実績ゼロが常態となるSKUの判別に向け、`weekend_zero_flag_f`（直近4週間の土日平均実績が0に近い場合のフラグ）、`weekend_nonzero_rate_f`（土日非ゼロ率）を追加。土日需要がほぼ無い系列を頻度モデルに反映し、週末の過大予測を抑える。
+
+2. ボラティリティ指標の拡充
+   - 追加特徴量: `rolling_median_7_f` / `rolling_median_14_f`、`rolling_iqr_14_f`（四分位幅）、`rolling_cv_14_f`（変動係数）、`peak_to_mean_ratio_14_f`（最大÷平均）。
+   - 実装箇所: 既存ローリング計算に中央値・分散量を加える処理を `generate_features_product_level.py` に組み込み。
+   - 期待効果: 高ボラSKUで生じた月次WAPEの跳ね上がりを事前に検知し、モデルが極値を控える方向へ学習する。
+
+3. トレンド・季節構造の再強化
+   - 追加特徴量: `trend_28_slope_f`（28日単回帰の傾き）、`month_over_month_ratio_f`（当月平均÷前月平均）、`seasonal_week_mean_f` / `seasonal_week_std_f`（週番号単位の平滑値）。
+   - 実装箇所: `FeatureState` に最新28日分の窓を保持し、`numpy.polyfit`等で傾きを算出。月次・週次平均は `product_static_info.json` の既存マップに追記。
+   - 期待効果: 2月のような月次シフトや週次イベントを特徴で吸収し、突発的に見えた需要変動をモデルが説明できるようにする。
+
+4. 予測バイアスの補正指標
+   - 追加特徴量: `cumulative_pred_to_actual_ratio_f`（累積予測/実績比の滑動平均）、`recent_bias_ratio_14_f`（直近14日の予測 vs 実績比率を特徴として保持）。
+   - 実装箇所: 推論時に利用する `FeatureState` が予測値を取り込むタイミングでバイアス指標を更新できるよう改修し、学習データ生成時は実績のみで初期化。
+   - 期待効果: 過大予測が続く系列をモデルが自己認識し、出力値を抑制する方向へ寄与。
+
+5. カレンダ・イベント強度の粒度向上
+   - 追加特徴量: `days_to_next_holiday_f` / `days_from_prev_holiday_f`、`is_payday_window_f`（月末±2営業日）、`fiscal_period_f`（決算期フラグなど業務カレンダに依存する要素）。
+   - 実装箇所: 既存の `is_business_day` 判定を拡張し、営業日カウント関数を活用して日付差を計算。
+   - 期待効果: 月末や祝日前後に集中する需要パターンを捕捉し、特定月に集中して崩れた予測を補正する。
+
+【補足】
+- 追加する統計量は `FEATURE_COLUMNS` に追記し、モデル学習コード（`train_model_product_level.py`）では新規列を自動認識できるよう改修する。
+- `work/script/tmp` のEDAで用いる `summary_core.csv` 等にも新指標を書き出すことで、改善効果を定点観測できるようにする。

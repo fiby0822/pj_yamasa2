@@ -79,6 +79,8 @@ def load_static_info(base_dir: str) -> Dict[str, Dict[str, float]]:
         # JSON 上は文字列キーになっている月別統計を int に戻す
         month_mean_map = {int(k): float(v) for k, v in info.get("month_mean_map", {}).items()}
         month_std_map = {int(k): float(v) for k, v in info.get("month_std_map", {}).items()}
+        week_mean_map = {int(k): float(v) for k, v in info.get("week_mean_map", {}).items()}
+        week_std_map = {int(k): float(v) for k, v in info.get("week_std_map", {}).items()}
 
         static_info[material_key] = {
             "material_idx": float(info.get("material_idx", 0.0)),
@@ -90,6 +92,8 @@ def load_static_info(base_dir: str) -> Dict[str, Dict[str, float]]:
             "volume_segment_f": float(info.get("volume_segment_f", 0.0)),
             "month_mean_map": month_mean_map,
             "month_std_map": month_std_map,
+            "week_mean_map": week_mean_map,
+            "week_std_map": week_std_map,
         }
 
     return static_info
@@ -257,7 +261,7 @@ def sequential_forecast(
                 }
             )
 
-            state.add_observation(current_date, y_pred)
+            state.add_observation(current_date, y_pred, is_actual=False)
 
     pred_df = pd.DataFrame(predictions)
     if pred_df.empty:

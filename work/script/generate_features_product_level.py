@@ -29,6 +29,7 @@ from typing import Deque, Dict, Iterable, List, Optional, Tuple
 import jpholiday
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import DateOffset, MonthEnd
 
 
 # --------------------------------------------------------------------------------------
@@ -49,6 +50,8 @@ STD_WINDOWS = (7, 14, 28)
 NONZERO_WINDOWS = (7, 14)
 TREND_LAGS = (7, 14)
 VOLUME_THRESHOLD = 5000
+WEEKEND_LOOKBACK_DAYS = 28
+WEEKEND_ZERO_THRESHOLD = 0.1
 
 
 CALENDAR_FEATURES = [
@@ -61,6 +64,10 @@ CALENDAR_FEATURES = [
     "iso_week",
     "is_month_start",
     "is_month_end",
+    "days_to_next_holiday_f",
+    "days_from_prev_holiday_f",
+    "is_payday_window_f",
+    "fiscal_period_f",
 ]
 
 STATEFUL_FEATURES = [
@@ -79,11 +86,20 @@ STATEFUL_FEATURES = [
     "rolling_std_28_f",
     "rolling_min_7_f",
     "rolling_max_7_f",
+    "rolling_median_7_f",
+    "rolling_median_14_f",
+    "rolling_iqr_14_f",
+    "rolling_cv_14_f",
+    "peak_to_mean_ratio_14_f",
     "ewm_mean_7_f",
     "ewm_mean_14_f",
     "ewm_mean_30_f",
     "recent_nonzero_ratio_7_f",
     "recent_nonzero_ratio_14_f",
+    "recent_nonzero_run_length_7_f",
+    "recent_nonzero_run_length_14_f",
+    "zero_run_length_7_f",
+    "zero_run_length_14_f",
     "days_since_last_obs_f",
     "days_since_last_nonzero_f",
     "gap_business_days_f",
@@ -91,8 +107,23 @@ STATEFUL_FEATURES = [
     "cumulative_std_f",
     "trend_7_ratio_f",
     "trend_14_ratio_f",
+    "trend_28_slope_f",
+    "month_over_month_ratio_f",
     "seasonal_month_mean_f",
     "seasonal_month_std_f",
+    "seasonal_week_mean_f",
+    "seasonal_week_std_f",
+    "cumulative_pred_to_actual_ratio_f",
+    "recent_bias_ratio_14_f",
+    "weekend_zero_flag_f",
+    "weekend_nonzero_rate_f",
+    "dow_nonzero_rate_f_0",
+    "dow_nonzero_rate_f_1",
+    "dow_nonzero_rate_f_2",
+    "dow_nonzero_rate_f_3",
+    "dow_nonzero_rate_f_4",
+    "dow_nonzero_rate_f_5",
+    "dow_nonzero_rate_f_6",
 ]
 
 STATIC_FEATURES = [
@@ -144,6 +175,65 @@ def safe_ratio(numerator: float, denominator: float, default: float = 1.0) -> fl
     return float(numerator) / float(denominator)
 
 
+def business_days_distance(start: pd.Timestamp, end: pd.Timestamp) -> int:
+    """start から end までの営業日差分（end 側方向を正とする）。"""
+    if pd.isna(start) or pd.isna(end) or start == end:
+        return 0
+    step = 1 if start < end else -1
+    current = start
+    distance = 0
+    while current != end:
+        current += timedelta(days=step)
+        if is_business_day(current):
+            distance += step
+    return distance
+
+
+def days_to_next_holiday(date: pd.Timestamp, max_search: int = 30) -> float:
+    """次の休日日（祝日または週末）までの日数。見つからなければ max_search+1 を返す。"""
+    for offset in range(1, max_search + 1):
+        candidate = date + timedelta(days=offset)
+        if not is_business_day(candidate):
+            return float(offset)
+    return float(max_search + 1)
+
+
+def days_from_prev_holiday(date: pd.Timestamp, max_search: int = 30) -> float:
+    """直近の休日日からの日数。見つからなければ max_search+1 を返す。"""
+    for offset in range(1, max_search + 1):
+        candidate = date - timedelta(days=offset)
+        if not is_business_day(candidate):
+            return float(offset)
+    return float(max_search + 1)
+
+
+def payday_window_flag(date: pd.Timestamp, window: int = 2) -> float:
+    """月末±window 営業日内にあるかを判定するフラグ。"""
+    if pd.isna(date):
+        return 0.0
+    month_end = (date + MonthEnd(0)).normalize()
+    distance = business_days_distance(date, month_end)
+    return float(1.0 if abs(distance) <= window else 0.0)
+
+
+def fiscal_period_flag(date: pd.Timestamp) -> float:
+    """四半期末（3,6,9,12月）を fiscal period としてフラグ化。"""
+    if pd.isna(date):
+        return 0.0
+    return float(1.0 if date.month in (3, 6, 9, 12) else 0.0)
+
+
+def trailing_run_length(values: List[float], window: int, condition) -> int:
+    """末尾から window 件を対象に condition を満たす連続長を計算。"""
+    count = 0
+    for value in reversed(values[-window:]):
+        if condition(value):
+            count += 1
+        else:
+            break
+    return count
+
+
 def load_aggregated_data(base_dir: str) -> pd.DataFrame:
     """事前に集約済みの日次データを読み込む。"""
     path = os.path.join(base_dir, "prepared", AGGREGATED_INPUT_FILENAME)
@@ -181,8 +271,12 @@ class FeatureState:
     ewm_state: Dict[int, Optional[float]] = field(
         default_factory=lambda: {span: None for span in EWM_SPANS}
     )
+    dow_counts: Dict[int, int] = field(default_factory=lambda: {i: 0 for i in range(7)})
+    dow_nonzero_counts: Dict[int, int] = field(default_factory=lambda: {i: 0 for i in range(7)})
+    bias_history: Deque[float] = field(default_factory=lambda: deque(maxlen=MAX_HISTORY))
+    last_actual_value: Optional[float] = None
 
-    def add_observation(self, date: pd.Timestamp, value: float) -> None:
+    def add_observation(self, date: pd.Timestamp, value: float, is_actual: bool = True) -> None:
         """最新観測（実績または予測）を状態に追加する。"""
         if pd.isna(date):
             return
@@ -192,6 +286,12 @@ class FeatureState:
         if value > 0:
             self.last_nonzero_date = date
 
+        weekday = int(date.weekday())
+        if is_actual:
+            self.dow_counts[weekday] = self.dow_counts.get(weekday, 0) + 1
+            if value > 0:
+                self.dow_nonzero_counts[weekday] = self.dow_nonzero_counts.get(weekday, 0) + 1
+
         for span in self.ewm_spans:
             prev = self.ewm_state.get(span)
             if prev is None or np.isnan(prev):
@@ -199,6 +299,16 @@ class FeatureState:
             else:
                 alpha = 2.0 / (span + 1.0)
                 self.ewm_state[span] = alpha * value + (1 - alpha) * prev
+
+        if is_actual:
+            self.last_actual_value = value
+            ratio = 1.0
+        else:
+            denominator: Optional[float] = self.last_actual_value
+            if (denominator is None or denominator == 0.0) and len(self.history_values) >= 2:
+                denominator = self.history_values[-2]
+            ratio = safe_ratio(value, denominator, default=1.0)
+        self.bias_history.append(ratio)
 
     # ----------------------------------------------------------------------------------
 
@@ -220,6 +330,10 @@ class FeatureState:
             "iso_week": float(date.isocalendar().week),
             "is_month_start": float(date.day <= 7),
             "is_month_end": float(date.day >= 24),
+            "days_to_next_holiday_f": days_to_next_holiday(date),
+            "days_from_prev_holiday_f": days_from_prev_holiday(date),
+            "is_payday_window_f": payday_window_flag(date),
+            "fiscal_period_f": fiscal_period_flag(date),
         }
 
     def build_feature_row(
@@ -237,10 +351,13 @@ class FeatureState:
             return None
 
         history = self._history_list()
+        history_dates = list(self.history_dates)
         features: Dict[str, float] = {}
 
         def last_value(offset: int) -> float:
             return float(history[-offset]) if len(history) >= offset else np.nan
+        def tail(window: int) -> List[float]:
+            return history[-window:] if len(history) >= window else history[:]
 
         # ラグ
         features["lag_1_f"] = last_value(1)
@@ -252,19 +369,68 @@ class FeatureState:
 
         # ローリング
         for window in ROLLING_WINDOWS:
-            window_values = history[-window:]
+            window_values = tail(window)
             features[f"rolling_mean_{window}_f"] = float(np.mean(window_values))
             features[f"rolling_min_{window}_f"] = float(np.min(window_values))
             features[f"rolling_max_{window}_f"] = float(np.max(window_values))
 
         for window in STD_WINDOWS:
-            window_values = history[-window:]
+            window_values = tail(window)
             features[f"rolling_std_{window}_f"] = float(np.std(window_values, ddof=0))
 
         for window in NONZERO_WINDOWS:
-            window_values = history[-window:]
-            nonzero_ratio = sum(1 for v in window_values if v > 0) / float(window)
+            window_values = tail(window)
+            nonzero_ratio = sum(1 for v in window_values if v > 0) / float(window) if window_values else 0.0
             features[f"recent_nonzero_ratio_{window}_f"] = float(nonzero_ratio)
+
+        # 追加ローリング統計
+        last_7 = tail(7)
+        last_14 = tail(14)
+        if last_7:
+            features["rolling_median_7_f"] = float(np.median(last_7))
+        else:
+            features["rolling_median_7_f"] = 0.0
+        if last_14:
+            features["rolling_median_14_f"] = float(np.median(last_14))
+            q75, q25 = np.percentile(last_14, [75, 25])
+            features["rolling_iqr_14_f"] = float(q75 - q25)
+            mean_14 = float(np.mean(last_14))
+            std_14 = float(np.std(last_14, ddof=0))
+            features["rolling_cv_14_f"] = safe_ratio(std_14, mean_14, default=0.0)
+            features["peak_to_mean_ratio_14_f"] = safe_ratio(float(np.max(last_14)), mean_14, default=0.0)
+        else:
+            features["rolling_median_14_f"] = 0.0
+            features["rolling_iqr_14_f"] = 0.0
+            features["rolling_cv_14_f"] = 0.0
+            features["peak_to_mean_ratio_14_f"] = 0.0
+
+        # 連続日数関連
+        features["recent_nonzero_run_length_7_f"] = float(trailing_run_length(history, 7, lambda v: v > 0))
+        features["recent_nonzero_run_length_14_f"] = float(trailing_run_length(history, 14, lambda v: v > 0))
+        features["zero_run_length_7_f"] = float(trailing_run_length(history, 7, lambda v: v <= 0))
+        features["zero_run_length_14_f"] = float(trailing_run_length(history, 14, lambda v: v <= 0))
+
+        # 週末需要の評価
+        recent_weekend_values = [
+            val
+            for val, dt in zip(history, history_dates)
+            if dt.weekday() >= 5 and (current_date - dt).days <= WEEKEND_LOOKBACK_DAYS and dt < current_date
+        ]
+        if recent_weekend_values:
+            weekend_nonzero = sum(1 for v in recent_weekend_values if v > 0)
+            weekend_rate = weekend_nonzero / float(len(recent_weekend_values))
+            weekend_zero_flag = 1.0 if np.mean(recent_weekend_values) <= WEEKEND_ZERO_THRESHOLD else 0.0
+        else:
+            weekend_rate = 0.0
+            weekend_zero_flag = 0.0
+        features["weekend_nonzero_rate_f"] = float(weekend_rate)
+        features["weekend_zero_flag_f"] = float(weekend_zero_flag)
+
+        # 曜日別非ゼロ率
+        for dow in range(7):
+            total = self.dow_counts.get(dow, 0)
+            nonzero = self.dow_nonzero_counts.get(dow, 0)
+            features[f"dow_nonzero_rate_f_{dow}"] = float(nonzero / total) if total > 0 else 0.0
 
         # EWM
         for span in self.ewm_spans:
@@ -296,6 +462,29 @@ class FeatureState:
         for lag in TREND_LAGS:
             prev = last_value(lag)
             features[f"trend_{lag}_ratio_f"] = safe_ratio(history[-1], prev)
+        last_28 = tail(28)
+        if len(last_28) >= 5:
+            x = np.arange(len(last_28))
+            slope, _ = np.polyfit(x, last_28, deg=1)
+            features["trend_28_slope_f"] = float(slope)
+        else:
+            features["trend_28_slope_f"] = 0.0
+
+        # 月次モメンタム
+        current_month_vals = [
+            val
+            for val, dt in zip(history, history_dates)
+            if dt.year == current_date.year and dt.month == current_date.month and dt < current_date
+        ]
+        prev_month_anchor = current_date - DateOffset(months=1)
+        prev_month_vals = [
+            val
+            for val, dt in zip(history, history_dates)
+            if dt.year == prev_month_anchor.year and dt.month == prev_month_anchor.month and dt < current_date
+        ]
+        current_mean = float(np.mean(current_month_vals)) if current_month_vals else float(static_info.get("product_mean_f", 0.0))
+        prev_mean = float(np.mean(prev_month_vals)) if prev_month_vals else float(static_info.get("product_mean_f", 0.0))
+        features["month_over_month_ratio_f"] = safe_ratio(current_mean, prev_mean)
 
         # 季節要因
         month = int(current_date.month)
@@ -305,6 +494,22 @@ class FeatureState:
         seasonal_std = month_std_map.get(month, static_info.get("product_std_f", 0.0))
         features["seasonal_month_mean_f"] = float(seasonal_mean)
         features["seasonal_month_std_f"] = float(seasonal_std)
+        iso_week = int(current_date.isocalendar().week)
+        week_mean_map: Dict[int, float] = static_info.get("week_mean_map", {})
+        week_std_map: Dict[int, float] = static_info.get("week_std_map", {})
+        week_mean = week_mean_map.get(iso_week, seasonal_mean)
+        week_std = week_std_map.get(iso_week, seasonal_std)
+        features["seasonal_week_mean_f"] = float(week_mean)
+        features["seasonal_week_std_f"] = float(week_std)
+
+        # バイアス指標
+        if self.bias_history:
+            bias_values = list(self.bias_history)
+            features["cumulative_pred_to_actual_ratio_f"] = float(np.mean(bias_values))
+            features["recent_bias_ratio_14_f"] = float(np.mean(bias_values[-14:]))
+        else:
+            features["cumulative_pred_to_actual_ratio_f"] = 1.0
+            features["recent_bias_ratio_14_f"] = 1.0
 
         # 定数（静的）特徴量
         for key in STATIC_FEATURES:
@@ -355,6 +560,15 @@ def prepare_static_info(
         .rename(columns={"mean": "month_mean", "std": "month_std"})
     )
 
+    week_stats = train_df.copy()
+    iso_calendar = week_stats["file_date"].dt.isocalendar()
+    week_stats["iso_week"] = iso_calendar.week.astype(int)
+    week_stats = (
+        week_stats.groupby(["material_key", "iso_week"])["actual_value"]
+        .agg(["mean", "std"])
+        .rename(columns={"mean": "week_mean", "std": "week_std"})
+    )
+
     static_info: Dict[str, Dict[str, float]] = {}
     for material_key, idx in material_index_map.items():
         if material_key in stats.index:
@@ -374,6 +588,8 @@ def prepare_static_info(
 
         month_mean_map: Dict[int, float] = {}
         month_std_map: Dict[int, float] = {}
+        week_mean_map: Dict[int, float] = {}
+        week_std_map: Dict[int, float] = {}
         if material_key in month_stats.index.get_level_values(0):
             month_slice = month_stats.loc[material_key]
             if isinstance(month_slice, pd.Series):
@@ -388,6 +604,19 @@ def prepare_static_info(
                     month_std_map[int(month)] = float(
                         values["month_std"] if not np.isnan(values["month_std"]) else 0.0
                     )
+        if material_key in week_stats.index.get_level_values(0):
+            week_slice = week_stats.loc[material_key]
+            if isinstance(week_slice, pd.Series):
+                week_mean_map[int(week_slice.name)] = float(week_slice["week_mean"])
+                week_std_map[int(week_slice.name)] = float(
+                    week_slice["week_std"] if not np.isnan(week_slice["week_std"]) else 0.0
+                )
+            else:
+                for week, values in week_slice.iterrows():
+                    week_mean_map[int(week)] = float(values["week_mean"])
+                    week_std_map[int(week)] = float(
+                        values["week_std"] if not np.isnan(values["week_std"]) else 0.0
+                    )
 
         volume_segment = 1.0 if row["product_sum_f"] >= volume_threshold else 0.0
 
@@ -401,6 +630,8 @@ def prepare_static_info(
             "volume_segment_f": float(volume_segment),
             "month_mean_map": month_mean_map,
             "month_std_map": month_std_map,
+            "week_mean_map": week_mean_map,
+            "week_std_map": week_std_map,
         }
 
     return static_info
@@ -483,6 +714,8 @@ def save_static_info(
             "volume_segment_f": info["volume_segment_f"],
             "month_mean_map": {str(k): float(v) for k, v in info["month_mean_map"].items()},
             "month_std_map": {str(k): float(v) for k, v in info["month_std_map"].items()},
+            "week_mean_map": {str(k): float(v) for k, v in info.get("week_mean_map", {}).items()},
+            "week_std_map": {str(k): float(v) for k, v in info.get("week_std_map", {}).items()},
         }
 
     path = os.path.join(output_dir, STATIC_INFO_FILENAME)
