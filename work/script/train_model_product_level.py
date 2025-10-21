@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -42,6 +43,8 @@ PREDICTIONS_DIRNAME = "predictions"
 MODELS_DIRNAME = "models"
 OUTPUT_DIRNAME = "output"
 EPSILON = 1e-6
+SOFT_CLIP_MULTIPLIER = 1.5
+WEEKEND_WHITELIST: set[str] = set()
 
 
 def _parse_month(month_str: str) -> pd.Timestamp:
@@ -81,6 +84,7 @@ def load_static_info(base_dir: str) -> Dict[str, Dict[str, float]]:
         month_std_map = {int(k): float(v) for k, v in info.get("month_std_map", {}).items()}
         week_mean_map = {int(k): float(v) for k, v in info.get("week_mean_map", {}).items()}
         week_std_map = {int(k): float(v) for k, v in info.get("week_std_map", {}).items()}
+        weekday_mean_map = {int(k): float(v) for k, v in info.get("weekday_mean_map", {}).items()}
 
         static_info[material_key] = {
             "material_idx": float(info.get("material_idx", 0.0)),
@@ -94,6 +98,7 @@ def load_static_info(base_dir: str) -> Dict[str, Dict[str, float]]:
             "month_std_map": month_std_map,
             "week_mean_map": week_mean_map,
             "week_std_map": week_std_map,
+            "weekday_mean_map": weekday_mean_map,
         }
 
     return static_info
@@ -248,6 +253,18 @@ def sequential_forecast(
             else:
                 vector = np.array([feature_row[col] for col in feature_cols], dtype=np.float32).reshape(1, -1)
                 y_pred = float(model.predict(vector)[0])
+
+            if feature_row:
+                peak_actual = feature_row.get("recent_peak_actual_f", 0.0)
+                if peak_actual and peak_actual > 0:
+                    cap = float(peak_actual) * SOFT_CLIP_MULTIPLIER
+                    if y_pred > cap:
+                        delta = y_pred - cap
+                        scale = cap if cap > EPSILON else 1.0
+                        y_pred = cap + scale * math.tanh(delta / (scale + EPSILON))
+
+            if current_date.weekday() >= 5 and material_key not in WEEKEND_WHITELIST:
+                y_pred = 0.0
 
             y_pred = max(y_pred, 0.0)
             actual_value = float(actual_series.get(current_date, 0.0))

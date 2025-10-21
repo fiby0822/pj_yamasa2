@@ -47,11 +47,13 @@ MAX_HISTORY = 180
 EWM_SPANS = (7, 14, 30)
 ROLLING_WINDOWS = (3, 7, 14, 28)
 STD_WINDOWS = (7, 14, 28)
-NONZERO_WINDOWS = (7, 14)
+NONZERO_WINDOWS = (7, 14, 28)
 TREND_LAGS = (7, 14)
 VOLUME_THRESHOLD = 5000
 WEEKEND_LOOKBACK_DAYS = 28
 WEEKEND_ZERO_THRESHOLD = 0.1
+WEEKEND_SUPPORT_MIN = 6
+WEEKDAY_RECENT_SAMPLES = 4
 
 
 CALENDAR_FEATURES = [
@@ -96,27 +98,36 @@ STATEFUL_FEATURES = [
     "ewm_mean_30_f",
     "recent_nonzero_ratio_7_f",
     "recent_nonzero_ratio_14_f",
+    "recent_nonzero_ratio_28_f",
+    "recent_zero_share_28_f",
     "recent_nonzero_run_length_7_f",
     "recent_nonzero_run_length_14_f",
     "zero_run_length_7_f",
     "zero_run_length_14_f",
+    "high_frequency_flag_f",
+    "high_freq_zero_penalty_f",
     "days_since_last_obs_f",
     "days_since_last_nonzero_f",
     "gap_business_days_f",
     "cumulative_mean_f",
     "cumulative_std_f",
+    "recent_actual_cumsum_28_f",
+    "recent_peak_actual_f",
     "trend_7_ratio_f",
     "trend_14_ratio_f",
     "trend_28_slope_f",
+    "short_long_mean_gap_f",
     "month_over_month_ratio_f",
     "seasonal_month_mean_f",
     "seasonal_month_std_f",
     "seasonal_week_mean_f",
     "seasonal_week_std_f",
-    "cumulative_pred_to_actual_ratio_f",
-    "recent_bias_ratio_14_f",
+    "seasonal_week_gap_f",
+    "recent_actual_to_seasonal_ratio_14_f",
+    "recent_actual_vs_weekday_mean_f",
     "weekend_zero_flag_f",
     "weekend_nonzero_rate_f",
+    "weekend_support_count_f",
     "dow_nonzero_rate_f_0",
     "dow_nonzero_rate_f_1",
     "dow_nonzero_rate_f_2",
@@ -124,6 +135,20 @@ STATEFUL_FEATURES = [
     "dow_nonzero_rate_f_4",
     "dow_nonzero_rate_f_5",
     "dow_nonzero_rate_f_6",
+    "weekday_zero_share_f_0",
+    "weekday_zero_share_f_1",
+    "weekday_zero_share_f_2",
+    "weekday_zero_share_f_3",
+    "weekday_zero_share_f_4",
+    "weekday_zero_share_f_5",
+    "weekday_zero_share_f_6",
+    "weekday_level_diff_f_0",
+    "weekday_level_diff_f_1",
+    "weekday_level_diff_f_2",
+    "weekday_level_diff_f_3",
+    "weekday_level_diff_f_4",
+    "weekday_level_diff_f_5",
+    "weekday_level_diff_f_6",
 ]
 
 STATIC_FEATURES = [
@@ -267,14 +292,14 @@ class FeatureState:
 
     history_values: Deque[float] = field(default_factory=lambda: deque(maxlen=MAX_HISTORY))
     history_dates: Deque[pd.Timestamp] = field(default_factory=lambda: deque(maxlen=MAX_HISTORY))
+    history_flags: Deque[bool] = field(default_factory=lambda: deque(maxlen=MAX_HISTORY))
     last_nonzero_date: Optional[pd.Timestamp] = None
     ewm_state: Dict[int, Optional[float]] = field(
         default_factory=lambda: {span: None for span in EWM_SPANS}
     )
     dow_counts: Dict[int, int] = field(default_factory=lambda: {i: 0 for i in range(7)})
     dow_nonzero_counts: Dict[int, int] = field(default_factory=lambda: {i: 0 for i in range(7)})
-    bias_history: Deque[float] = field(default_factory=lambda: deque(maxlen=MAX_HISTORY))
-    last_actual_value: Optional[float] = None
+    dow_zero_counts: Dict[int, int] = field(default_factory=lambda: {i: 0 for i in range(7)})
 
     def add_observation(self, date: pd.Timestamp, value: float, is_actual: bool = True) -> None:
         """最新観測（実績または予測）を状態に追加する。"""
@@ -283,6 +308,7 @@ class FeatureState:
         value = float(value)
         self.history_values.append(value)
         self.history_dates.append(date)
+        self.history_flags.append(is_actual)
         if value > 0:
             self.last_nonzero_date = date
 
@@ -291,6 +317,8 @@ class FeatureState:
             self.dow_counts[weekday] = self.dow_counts.get(weekday, 0) + 1
             if value > 0:
                 self.dow_nonzero_counts[weekday] = self.dow_nonzero_counts.get(weekday, 0) + 1
+            else:
+                self.dow_zero_counts[weekday] = self.dow_zero_counts.get(weekday, 0) + 1
 
         for span in self.ewm_spans:
             prev = self.ewm_state.get(span)
@@ -299,16 +327,6 @@ class FeatureState:
             else:
                 alpha = 2.0 / (span + 1.0)
                 self.ewm_state[span] = alpha * value + (1 - alpha) * prev
-
-        if is_actual:
-            self.last_actual_value = value
-            ratio = 1.0
-        else:
-            denominator: Optional[float] = self.last_actual_value
-            if (denominator is None or denominator == 0.0) and len(self.history_values) >= 2:
-                denominator = self.history_values[-2]
-            ratio = safe_ratio(value, denominator, default=1.0)
-        self.bias_history.append(ratio)
 
     # ----------------------------------------------------------------------------------
 
@@ -352,12 +370,43 @@ class FeatureState:
 
         history = self._history_list()
         history_dates = list(self.history_dates)
+        history_flags = list(self.history_flags)
+        history_records = list(zip(history_dates, history, history_flags))
         features: Dict[str, float] = {}
 
         def last_value(offset: int) -> float:
             return float(history[-offset]) if len(history) >= offset else np.nan
+
         def tail(window: int) -> List[float]:
             return history[-window:] if len(history) >= window else history[:]
+
+        def last_actual_records(window: Optional[int] = None) -> List[Tuple[pd.Timestamp, float]]:
+            records: List[Tuple[pd.Timestamp, float]] = []
+            for date, value, flag in reversed(history_records):
+                if not flag:
+                    continue
+                records.append((date, value))
+                if window is not None and len(records) >= window:
+                    break
+            records.reverse()
+            return records
+
+        def actual_records_within_days(days: int, weekend_only: bool = False) -> List[Tuple[pd.Timestamp, float]]:
+            cutoff = current_date - timedelta(days=days)
+            records: List[Tuple[pd.Timestamp, float]] = []
+            for date, value, flag in reversed(history_records):
+                if not flag or date >= current_date:
+                    continue
+                if date < cutoff:
+                    break
+                if weekend_only and date.weekday() < 5:
+                    continue
+                records.append((date, value))
+            records.reverse()
+            return records
+
+        def values_from_records(records: List[Tuple[pd.Timestamp, float]]) -> List[float]:
+            return [value for _, value in records]
 
         # ラグ
         features["lag_1_f"] = last_value(1)
@@ -410,27 +459,36 @@ class FeatureState:
         features["zero_run_length_7_f"] = float(trailing_run_length(history, 7, lambda v: v <= 0))
         features["zero_run_length_14_f"] = float(trailing_run_length(history, 14, lambda v: v <= 0))
 
-        # 週末需要の評価
-        recent_weekend_values = [
-            val
-            for val, dt in zip(history, history_dates)
-            if dt.weekday() >= 5 and (current_date - dt).days <= WEEKEND_LOOKBACK_DAYS and dt < current_date
-        ]
-        if recent_weekend_values:
-            weekend_nonzero = sum(1 for v in recent_weekend_values if v > 0)
-            weekend_rate = weekend_nonzero / float(len(recent_weekend_values))
-            weekend_zero_flag = 1.0 if np.mean(recent_weekend_values) <= WEEKEND_ZERO_THRESHOLD else 0.0
+        recent_actual_14 = last_actual_records(14)
+        recent_actual_28 = last_actual_records(28)
+        recent_actual_values_14 = values_from_records(recent_actual_14)
+        recent_actual_values_28 = values_from_records(recent_actual_28)
+
+        # 週末需要（実績ベース）
+        weekend_records = actual_records_within_days(WEEKEND_LOOKBACK_DAYS, weekend_only=True)
+        weekend_support = len(weekend_records)
+        weekend_values = values_from_records(weekend_records)
+        if weekend_support >= WEEKEND_SUPPORT_MIN and weekend_values:
+            weekend_mean = float(np.mean(weekend_values))
+            weekend_zero_flag = 1.0 if weekend_mean <= WEEKEND_ZERO_THRESHOLD else 0.0
         else:
-            weekend_rate = 0.0
             weekend_zero_flag = 0.0
-        features["weekend_nonzero_rate_f"] = float(weekend_rate)
+        weekend_nonzero_rate = (
+            sum(1 for v in weekend_values if v > 0) / float(weekend_support)
+            if weekend_support > 0
+            else 0.0
+        )
         features["weekend_zero_flag_f"] = float(weekend_zero_flag)
+        features["weekend_nonzero_rate_f"] = float(weekend_nonzero_rate)
+        features["weekend_support_count_f"] = float(weekend_support)
 
         # 曜日別非ゼロ率
         for dow in range(7):
             total = self.dow_counts.get(dow, 0)
             nonzero = self.dow_nonzero_counts.get(dow, 0)
             features[f"dow_nonzero_rate_f_{dow}"] = float(nonzero / total) if total > 0 else 0.0
+            zeros = self.dow_zero_counts.get(dow, 0)
+            features[f"weekday_zero_share_f_{dow}"] = float(zeros / total) if total > 0 else 0.0
 
         # EWM
         for span in self.ewm_spans:
@@ -469,6 +527,11 @@ class FeatureState:
             features["trend_28_slope_f"] = float(slope)
         else:
             features["trend_28_slope_f"] = 0.0
+        features["short_long_mean_gap_f"] = safe_ratio(
+            features.get("rolling_mean_7_f", 0.0),
+            features.get("rolling_mean_28_f", 0.0),
+            default=1.0,
+        )
 
         # 月次モメンタム
         current_month_vals = [
@@ -501,15 +564,65 @@ class FeatureState:
         week_std = week_std_map.get(iso_week, seasonal_std)
         features["seasonal_week_mean_f"] = float(week_mean)
         features["seasonal_week_std_f"] = float(week_std)
+        features["seasonal_week_gap_f"] = safe_ratio(
+            features.get("rolling_mean_7_f", 0.0),
+            week_mean,
+            default=1.0,
+        )
 
-        # バイアス指標
-        if self.bias_history:
-            bias_values = list(self.bias_history)
-            features["cumulative_pred_to_actual_ratio_f"] = float(np.mean(bias_values))
-            features["recent_bias_ratio_14_f"] = float(np.mean(bias_values[-14:]))
+        # 実績ベースの指標
+        if recent_actual_values_14:
+            recent_mean_14 = float(np.mean(recent_actual_values_14))
+            features["recent_actual_to_seasonal_ratio_14_f"] = safe_ratio(
+                recent_mean_14,
+                seasonal_mean,
+                default=1.0,
+            )
+            weekday_mean_map: Dict[int, float] = static_info.get("weekday_mean_map", {})
+            weekday_baselines = [
+                weekday_mean_map.get(date.weekday(), static_info.get("product_mean_f", 0.0))
+                for date, _ in recent_actual_14
+            ]
+            baseline_mean = float(np.mean(weekday_baselines)) if weekday_baselines else float(static_info.get("product_mean_f", 0.0))
+            features["recent_actual_vs_weekday_mean_f"] = safe_ratio(
+                recent_mean_14,
+                baseline_mean,
+                default=1.0,
+            )
         else:
-            features["cumulative_pred_to_actual_ratio_f"] = 1.0
-            features["recent_bias_ratio_14_f"] = 1.0
+            features["recent_actual_to_seasonal_ratio_14_f"] = 1.0
+            features["recent_actual_vs_weekday_mean_f"] = 1.0
+
+        if recent_actual_values_28:
+            zero_share = sum(1 for v in recent_actual_values_28 if v <= 0) / float(len(recent_actual_values_28))
+            features["recent_zero_share_28_f"] = float(zero_share)
+            features["recent_actual_cumsum_28_f"] = float(sum(recent_actual_values_28))
+            features["recent_peak_actual_f"] = float(max(recent_actual_values_28))
+        else:
+            features["recent_zero_share_28_f"] = 0.0
+            features["recent_actual_cumsum_28_f"] = 0.0
+            features["recent_peak_actual_f"] = float(static_info.get("product_max_f", 0.0))
+
+        # 高頻度SKU向けのフラグ
+        recent_nonzero_ratio_28 = features.get("recent_nonzero_ratio_28_f", 0.0)
+        volume_segment = float(static_info.get("volume_segment_f", 0.0))
+        high_freq_flag = 1.0 if (volume_segment >= 1.0 and recent_nonzero_ratio_28 >= 0.8) else 0.0
+        features["high_frequency_flag_f"] = high_freq_flag
+        features["high_freq_zero_penalty_f"] = high_freq_flag * features.get("zero_run_length_7_f", 0.0)
+
+        # 曜日レベルの変化率
+        cumulative_mean = features.get("cumulative_mean_f", 0.0)
+        weekday_mean_map: Dict[int, float] = static_info.get("weekday_mean_map", {})
+        for dow in range(7):
+            actual_values_for_dow = [
+                value for date, value, flag in history_records if flag and date.weekday() == dow
+            ]
+            if actual_values_for_dow:
+                recent_slice = actual_values_for_dow[-WEEKDAY_RECENT_SAMPLES:]
+                recent_mean = float(np.mean(recent_slice))
+            else:
+                recent_mean = float(weekday_mean_map.get(dow, static_info.get("product_mean_f", 0.0)))
+            features[f"weekday_level_diff_f_{dow}"] = safe_ratio(recent_mean, cumulative_mean, default=1.0)
 
         # 定数（静的）特徴量
         for key in STATIC_FEATURES:
@@ -569,6 +682,14 @@ def prepare_static_info(
         .rename(columns={"mean": "week_mean", "std": "week_std"})
     )
 
+    weekday_stats = train_df.copy()
+    weekday_stats["weekday"] = weekday_stats["file_date"].dt.weekday
+    weekday_stats = (
+        weekday_stats.groupby(["material_key", "weekday"])["actual_value"]
+        .agg(["mean"])
+        .rename(columns={"mean": "weekday_mean"})
+    )
+
     static_info: Dict[str, Dict[str, float]] = {}
     for material_key, idx in material_index_map.items():
         if material_key in stats.index:
@@ -590,6 +711,7 @@ def prepare_static_info(
         month_std_map: Dict[int, float] = {}
         week_mean_map: Dict[int, float] = {}
         week_std_map: Dict[int, float] = {}
+        weekday_mean_map: Dict[int, float] = {}
         if material_key in month_stats.index.get_level_values(0):
             month_slice = month_stats.loc[material_key]
             if isinstance(month_slice, pd.Series):
@@ -617,6 +739,13 @@ def prepare_static_info(
                     week_std_map[int(week)] = float(
                         values["week_std"] if not np.isnan(values["week_std"]) else 0.0
                     )
+        if material_key in weekday_stats.index.get_level_values(0):
+            weekday_slice = weekday_stats.loc[material_key]
+            if isinstance(weekday_slice, pd.Series):
+                weekday_mean_map[int(weekday_slice.name)] = float(weekday_slice["weekday_mean"])
+            else:
+                for weekday, values in weekday_slice.iterrows():
+                    weekday_mean_map[int(weekday)] = float(values["weekday_mean"])
 
         volume_segment = 1.0 if row["product_sum_f"] >= volume_threshold else 0.0
 
@@ -632,6 +761,7 @@ def prepare_static_info(
             "month_std_map": month_std_map,
             "week_mean_map": week_mean_map,
             "week_std_map": week_std_map,
+            "weekday_mean_map": weekday_mean_map,
         }
 
     return static_info
@@ -716,6 +846,7 @@ def save_static_info(
             "month_std_map": {str(k): float(v) for k, v in info["month_std_map"].items()},
             "week_mean_map": {str(k): float(v) for k, v in info.get("week_mean_map", {}).items()},
             "week_std_map": {str(k): float(v) for k, v in info.get("week_std_map", {}).items()},
+            "weekday_mean_map": {str(k): float(v) for k, v in info.get("weekday_mean_map", {}).items()},
         }
 
     path = os.path.join(output_dir, STATIC_INFO_FILENAME)
