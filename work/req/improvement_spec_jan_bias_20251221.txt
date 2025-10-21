@@ -1,0 +1,49 @@
+目的:
+- vis_2024-12-31_3 の最新可視化結果を踏まえ、2025年1月の大幅な過大予測 (実績比 +259%) を中心に、2025年2-3月を含む精度改善策を整理する。
+- 改修対象は work/script 配下。EDA の追加実装や出力は work/script/tmp に限定する。
+
+現状把握:
+- 最新予測 (train_end_date=2024-12-31) の月別総量:
+  * 1月: 実績 472,935 / 予測 1,699,452 → 比率 3.59
+  * 2月: 実績 625,021 / 予測 670,217 → 比率 1.07
+  * 3月: 実績 659,587 / 予測 709,419 → 比率 1.08
+- 1月のみ極端な過大予測が発生。フィルタリング後も 96 製品すべてで同様の傾向が継続。
+- 12月末の実績と 1月需要ギャップを説明する特徴量・モデリングが不足。年次/閏年/営業初日などの季節要因が十分に捉えられていない。
+
+改善方針 (work/script 改修対象):
+
+1. 季節性・年替わり特徴量の拡充
+   - `generate_features_product_level.py`:
+     - 既存のイベントフラグに加え、`month` に紐づく周期特徴量を追加 (例: sin/cos 12ヶ月周期、半期・四半期フラグ)。
+     - 前年同月/前年末の平均との比率 (material_key × month) を算出するターゲットエンコーディングを導入。
+     - 年末年始の営業日構成 (祝日カウント、連続休暇長) を算出する helper を追加。必要なら `work/script/tmp` に EDA スクリプトを作成。
+
+2. December→January ギャップ対策のラグ/ベースライン強化
+   - 12月末 4〜6 週間の移動統計 (平均・減衰平均) と、前年 1月の実績を組み合わせた「ギャップ予測ラベル」を新設。
+   - 直近期特徴 (last_train_actual_f 等) に対し、`actual_value` の季節調整版 (1月シフト) を算出。
+   - 新しい特徴を `generate_features_product_level.py` に組み込み、リーク防止のため train データのみから算出。
+
+3. モデル目的関数・チューニングの見直し
+   - `train_model_product_level.py` / `train_and_save_product_level.py`:
+     - Optuna の評価指標を MAE + 月次総量乖離 (1月に重みを置く) へ拡張する custom objective を追加。
+     - 1月ステップ（Step1）のバリデーションウェイトを増加させる (例: カスタムスコアで step=1 を2倍加重)。
+     - XGBoost の `scale_pos_weight` 相当のペナルティ設定や Tweedie 回帰等、過大予測に強い損失を検証。
+
+4. 予測後の補正ロジック
+   - Post-processing モジュールを work/script に追加し、月次総量ベースのキャリブレーションを実装。
+     - 例: `calibrate_predictions.py` を新規追加し、直近12ヶ月の実績平均と比較した係数で 1月出力をスケーリング。
+   - `train_and_save_product_level.py` 内で、予測後に月別スケールファクタをログ出力し、検証用CSVも保存。
+
+5. モデル分割またはハイブリッド採用
+   - 低ボリューム/高季節性製品を抽出する EDA (`tmp/eda_post_leak_fix.py` を活用) → 低ボリューム群には SMA/指数平滑など単純モデルを選択。
+   - `train_model_product_level.py` にセグメント別学習分岐 (XGBoost vs. 単純モデル) を実装するオプションを追加。
+
+6. 検証体制
+   - 1月単月の `predicted_sum` と `actual_sum` を計算し、比率が 1.1 以下であることを自動チェックする関数を `visualize_predictions.py` 実行前後で導入。
+   - 追加メトリクス (月別MAPE、加重MAPE) を `work/vis_2024-12-31_3/summary` に出力できるよう `save_results_csv.py` or 新スクリプトで拡張。
+
+スケジュール提案:
+- Week1: EDA (year-over-year差分、月次偏り分析) を `work/script/tmp` に実装。
+- Week2: 特徴量追加 + Optunaスコア改善 → 再学習。
+- Week3: キャリブレーション/ポスト処理およびセグメント別モデル導入。
+- Week4: 総合評価・メトリクス検証、自動チェック実装。
