@@ -1,0 +1,27 @@
+改修日: 2024-12-31 (想定)
+対応者: Codex
+
+対象ディレクトリ: work/script
+
+実施内容概要:
+1. TimeSeriesPredictor に対するリーク防止パッチを追加 (train_model_product_level.py, train_and_save_product_level.py)
+   - 予測対象 Material Key を train_end_date 以前の実績情報のみで抽出する関数に差し替え。
+   - 既存の未来実績依存フィルタを無効化し、学習期間統計のみで選別。
+
+2. ローカル側の Product Key フィルタリングを再実装
+   - train_model_product_level.py: 学習期間実績に基づく選別へ切り替え。
+   - 選定対象と全対象の件数をログに出力し、予測対象集合を更新。
+
+3. 予測処理のカバレッジ可視化
+   - train_model_product_level.py / train_and_save_product_level.py 内で予測対象 Material Key 数をログ出力。
+   - train_and_save_product_level.py: 日次予測生成時に対象 Material Key 数を記録。
+
+4. データ分割バリデーションの追加 (generate_features_product_level.py)
+   - split_train_test 後に train データが train_end_date を超えていないか検証する validate_split を実装。
+
+5. 補足的な型ヒント・print ログ等の強化
+   - Future 実績参照を完全に除去した状態でも実行状況が追えるよう調整。
+
+備考:
+- TimeSeriesPredictor 本体 (/home/ubuntu/yamasa) には直接変更を加えていない。必要時のみローカルパッチが適用される。
+- 学習・推論処理の実行は本改修では未実施。

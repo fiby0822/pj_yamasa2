@@ -395,6 +395,23 @@ class ProductFeatureGenerator:
 
         return df
 
+    def validate_split(self, df: pd.DataFrame, train_end_date: str) -> None:
+        """
+        データ分割がリークを起こしていないか検証する。
+
+        Args:
+            df: split_train_test 後のデータ
+            train_end_date: 学習データの終了日
+        """
+        train_end = pd.to_datetime(train_end_date)
+        leaked_rows = df[(df['data_type'] == 'train') & (df['file_date'] > train_end)]
+        if not leaked_rows.empty:
+            raise ValueError(
+                "Train split contains records beyond train_end_date. "
+                "Please verify data preparation."
+            )
+        print("Split validation passed: train data does not extend beyond train_end_date.")
+
     def save_features(self, df: pd.DataFrame):
         """
         特徴量をローカルに保存
@@ -434,6 +451,7 @@ class ProductFeatureGenerator:
 
         # 2. データ分割（最初に実行：データリーク防止の核心）
         df = self.split_train_test(df, train_end_date)
+        self.validate_split(df, train_end_date)
 
         # 統計情報の表示
         train_size = (df['data_type'] == 'train').sum()

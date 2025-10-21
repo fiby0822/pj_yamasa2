@@ -14,6 +14,7 @@ from dateutil.relativedelta import relativedelta
 import json
 import warnings
 warnings.filterwarnings('ignore')
+from typing import Optional
 
 from modules.models.train_predict import TimeSeriesPredictor
 
@@ -26,6 +27,60 @@ def _save_model_to_s3_dummy(self, model, params, save_dir=None):
 
 # TimeSeriesPredictorクラスのメソッドをオーバーライド
 TimeSeriesPredictor._save_model_to_s3 = _save_model_to_s3_dummy
+
+
+def apply_leak_safe_predictor_patch():
+    """
+    TimeSeriesPredictor の Material Key フィルタリングを学習期間ベースに差し替える。
+    未来実績を使用せず、train_end_date 以前の情報のみでフィルタリングする。
+    """
+
+    def _filter_no_leak(
+        self,
+        df: pd.DataFrame,
+        train_end_date: str,
+        target_col: str,
+        step_count: int,
+        verbose: bool = True,
+        min_test_active_records: Optional[int] = None
+    ) -> tuple[pd.DataFrame, set]:
+        train_end = pd.to_datetime(train_end_date)
+        df_train = df[df['date'] <= train_end].copy()
+
+        if verbose:
+            print("\n===== Material Keyフィルタリング（リーク対策版） =====")
+            print(f"  入力: {len(df):,} 行, Material Keys: {df['material_key'].nunique():,}")
+            print(f"  使用範囲: ~{train_end.strftime('%Y-%m-%d')}")
+
+        if df_train.empty:
+            if verbose:
+                print("  学習期間データが空のため、フィルタリングをスキップします。")
+            return df, set(df['material_key'].unique())
+
+        active_train = df_train[df_train[target_col] > 0]
+        history_counts = active_train.groupby('material_key').size()
+
+        top_limit = 7000
+        top_keys = set(history_counts.nlargest(top_limit).index)
+        required_history = min_test_active_records if min_test_active_records is not None else step_count * 4
+        if required_history <= 0:
+            required_history = 1
+        history_active_keys = set(history_counts[history_counts >= required_history].index)
+
+        selected_keys = top_keys | history_active_keys
+        if not selected_keys:
+            selected_keys = set(df_train['material_key'].unique())
+
+        df_filtered = df[df['material_key'].isin(selected_keys)].copy()
+
+        if verbose:
+            print(f"  学習期間アクティブ製品: {len(history_counts):,}")
+            print(f"  上位{len(top_keys):,} 製品（train実績）と最低活動 {required_history} 件を考慮")
+            print(f"  フィルタ後: {len(df_filtered):,} 行, Material Keys: {df_filtered['material_key'].nunique():,}")
+
+        return df_filtered, set(selected_keys)
+
+    TimeSeriesPredictor._filter_important_material_keys = _filter_no_leak
 
 
 class ProductLevelTrainer:
@@ -53,6 +108,7 @@ class ProductLevelTrainer:
 
         # TimeSeriesPredictor (ローカルモードで使用)
         # S3へのアクセスを無効化するため、ダミーのbucket_nameを設定
+        apply_leak_safe_predictor_patch()
         predictor = TimeSeriesPredictor(
             bucket_name="dummy-bucket",
             model_type="product_level"
@@ -74,6 +130,10 @@ class ProductLevelTrainer:
             apply_winsorization=False,
             apply_hampel=False
         )
+
+        predicted_keys = df_pred['material_key'].nunique() if not df_pred.empty and 'material_key' in df_pred.columns else 0
+        total_keys = df['material_key'].nunique() if 'material_key' in df.columns else 0
+        print(f"Predictions generated for {predicted_keys} / {total_keys} material_keys in evaluation window.")
 
         return {
             'df_pred': df_pred,  # 実際の予測結果
@@ -173,7 +233,8 @@ class ProductLevelTrainer:
         # 日付でソート
         df_predictions = df_predictions.sort_values(['date', 'material_key'])
 
-        print(f"Created {len(df_predictions):,} daily predictions")
+        material_key_count = df_predictions['material_key'].nunique()
+        print(f"Created {len(df_predictions):,} daily predictions across {material_key_count} material_keys")
         return df_predictions
 
     def create_material_summary(self, df_predictions):
