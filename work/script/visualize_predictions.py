@@ -312,6 +312,38 @@ class PredictionVisualizer:
         labels = [f"{bin_edges[i]}-{bin_edges[i + 1]}%" for i in range(len(bin_edges) - 1)]
         labels.append("100%+")
 
+        output_path = self.graph_dir / "simple_error_histogram.png"
+        self._plot_simple_error_hist(
+            simple_error,
+            bins,
+            labels,
+            output_path,
+            "Simple Error Distribution (10% bins)",
+        )
+
+        per_key_dir = self.graph_dir / "simple_error_by_key"
+        per_key_dir.mkdir(parents=True, exist_ok=True)
+        for material_key, group in pred_df.groupby("material_key"):
+            key_simple_error = group["simple_error_pct"].dropna()
+            if key_simple_error.empty:
+                continue
+            key_output = per_key_dir / f"simple_error_histogram_{material_key}.png"
+            self._plot_simple_error_hist(
+                key_simple_error,
+                bins,
+                labels,
+                key_output,
+                f"Simple Error Distribution (10% bins) - {material_key}",
+            )
+
+    def _plot_simple_error_hist(
+        self,
+        simple_error: pd.Series,
+        bins: list[int],
+        labels: list[str],
+        output_path: Path,
+        title: str,
+    ) -> None:
         counts = pd.cut(
             simple_error,
             bins=bins,
@@ -319,29 +351,31 @@ class PredictionVisualizer:
             labels=labels,
             include_lowest=True,
         ).value_counts(sort=False)
+        total = counts.sum()
 
         plt.figure(figsize=(10, 6))
-        bars = plt.bar(range(len(counts)), counts.values, color="#4c72b0", alpha=0.8)
-        plt.xticks(range(len(counts)), counts.index, rotation=45, ha="right")
+        indices = range(len(counts))
+        bars = plt.bar(indices, counts.values, color="#4c72b0", alpha=0.8)
+        plt.xticks(indices, counts.index, rotation=45, ha="right")
         plt.xlabel("Simple Error (%)", fontsize=12)
         plt.ylabel("Record Count", fontsize=12)
-        plt.title("Simple Error Distribution (10% bins)", fontsize=14)
+        plt.title(title, fontsize=14)
         plt.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
 
         for bar, count in zip(bars, counts.values):
-            if count > 0:
+            if count > 0 and total > 0:
+                percent = (count / total) * 100.0
                 height = bar.get_height()
                 plt.text(
                     bar.get_x() + bar.get_width() / 2,
                     height,
-                    f"{int(count)}",
+                    f"{percent:.1f}%",
                     ha="center",
                     va="bottom",
                     fontsize=10,
                 )
 
         plt.tight_layout()
-        output_path = self.graph_dir / "simple_error_histogram.png"
         plt.savefig(output_path)
         plt.close()
         print(f"  Simple Errorヒストグラムを出力: {output_path}")
