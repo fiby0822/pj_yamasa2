@@ -1,0 +1,34 @@
+======================================================================
+Accuracy Summary Report
+Generated at: 2025-10-22 07:34:52.451005
+======================================================================
+
+Overall MAE : 114.70
+Overall RMSE: 373.84
+Overall sMAPE: 51.25% (Accuracy 48.75%)
+Overall Simple Error: 73.31%
+Overall WAPE : 53.53%
+
+Top 10 products by accuracy:
+- A067390: Accuracy 78.05%, sMAPE 21.95%, SimpleErr 13.31%, WAPE 24.04%, MAE 260.85, RMSE 435.03, Samples 181
+- A01120A: Accuracy 77.58%, sMAPE 22.42%, SimpleErr 14.78%, WAPE 26.75%, MAE 95.16, RMSE 175.40, Samples 181
+- A030830: Accuracy 76.68%, sMAPE 23.32%, SimpleErr 15.31%, WAPE 28.50%, MAE 194.86, RMSE 328.59, Samples 181
+- A016010: Accuracy 76.49%, sMAPE 23.51%, SimpleErr 13.76%, WAPE 22.62%, MAE 198.96, RMSE 327.93, Samples 181
+- A162840: Accuracy 75.56%, sMAPE 24.44%, SimpleErr 17.04%, WAPE 29.84%, MAE 190.15, RMSE 338.72, Samples 181
+- A01101A: Accuracy 73.10%, sMAPE 26.90%, SimpleErr 18.94%, WAPE 34.57%, MAE 134.00, RMSE 223.07, Samples 181
+- A172840: Accuracy 73.03%, sMAPE 26.97%, SimpleErr 21.07%, WAPE 29.63%, MAE 78.34, RMSE 137.45, Samples 181
+- A064340: Accuracy 72.23%, sMAPE 27.77%, SimpleErr 19.39%, WAPE 34.36%, MAE 289.76, RMSE 469.90, Samples 181
+- A012090: Accuracy 72.22%, sMAPE 27.78%, SimpleErr 19.25%, WAPE 35.57%, MAE 280.46, RMSE 426.00, Samples 181
+- A131700: Accuracy 72.05%, sMAPE 27.95%, SimpleErr 20.00%, WAPE 41.57%, MAE 71.50, RMSE 138.31, Samples 181
+
+Bottom 10 products by accuracy:
+- A188460: Accuracy 23.24%, sMAPE 76.76%, SimpleErr 221.99%, WAPE 85.28%, MAE 50.38, RMSE 106.89, Samples 181
+- A153730: Accuracy 20.12%, sMAPE 79.88%, SimpleErr 56.43%, WAPE 179.48%, MAE 3.50, RMSE 5.56, Samples 181
+- A175080: Accuracy 13.54%, sMAPE 86.46%, SimpleErr 49.12%, WAPE 229.12%, MAE 67.52, RMSE 107.92, Samples 181
+- A181930: Accuracy 12.30%, sMAPE 87.70%, SimpleErr 41.66%, WAPE 226.11%, MAE 3.29, RMSE 5.39, Samples 181
+- A01233F: Accuracy 12.30%, sMAPE 87.70%, SimpleErr 56.88%, WAPE 197.41%, MAE 17.11, RMSE 50.27, Samples 181
+- A101330: Accuracy 11.16%, sMAPE 88.84%, SimpleErr 32.39%, WAPE 186.24%, MAE 3.82, RMSE 5.65, Samples 181
+- A168210: Accuracy 7.78%, sMAPE 92.22%, SimpleErr 78.28%, WAPE 113.82%, MAE 14.32, RMSE 25.41, Samples 181
+- A067414: Accuracy 7.42%, sMAPE 92.58%, SimpleErr 100.53%, WAPE 114.06%, MAE 508.16, RMSE 893.47, Samples 181
+- A168460: Accuracy -4.62%, sMAPE 104.62%, SimpleErr 38.28%, WAPE 460.21%, MAE 1241.43, RMSE 1617.67, Samples 181
+- A186710: Accuracy -5.94%, sMAPE 105.94%, SimpleErr 103.63%, WAPE 206.44%, MAE 6.52, RMSE 9.62, Samples 181

@@ -1,0 +1,24 @@
+予測精度関連指標の分析レポート
+対象: report_2025-01_to_03_imp2 / report_2025-04_to_06_imp2
+
+【2025年1-3月】
+- データ件数: 98 SKU
+- Accuracy中央値: 53.67% / 平均: 49.55%
+  ・business Accuracy中央値 49.73% (n=48)
+  ・household Accuracy中央値 56.23% (n=50)
+- 相関係数: ゼロ比率 vs Accuracy = -0.716, 実績標準偏差 vs Accuracy = 0.301, CV vs Accuracy = -0.688
+- 相関係数: 予測バイアス比率 vs Accuracy = -0.429, 実績総量 vs Accuracy = 0.376
+
+【2025年4-6月】
+- データ件数: 98 SKU
+- Accuracy中央値: 57.54% / 平均: 52.55%
+  ・business Accuracy中央値 55.99% (n=48)
+  ・household Accuracy中央値 60.25% (n=50)
+- 相関係数: ゼロ比率 vs Accuracy = -0.838, 実績標準偏差 vs Accuracy = 0.240, CV vs Accuracy = -0.812
+- 相関係数: 予測バイアス比率 vs Accuracy = -0.386, 実績総量 vs Accuracy = 0.310
+
+主な観察結果
+1. 家庭用SKUのAccuracy分布は業務用より高く、ゼロ需要比率が低いSKUほど精度が向上する強い負の相関が確認できる。
+2. 実績CVが高いSKUほどAccuracyが低下する傾向があり、需要変動の大きさが予測難易度に直結している。
+3. 予測バイアス（予測と実績の乖離）が大きいSKUではAccuracyが低下し、特に実績少量品で過大予測が課題。
+4. 実績ボリュームが大きいSKUはAccuracyも安定しやすく、重量づけ学習や重要SKU優先でのモデル改修が効果的。

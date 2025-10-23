@@ -1,0 +1,15 @@
+2025年1-6月 Simple Error 分析レポート
+
+対象SKU数: 98
+Simple Error中央値: 36.26% / 平均: 40.05%
+・business SKU: 件数 48, Simple Error中央値 39.19%, 平均 40.78%
+・household SKU: 件数 50, Simple Error中央値 33.26%, 平均 39.35%
+
+相関係数: ゼロ実績比率 vs Simple Error = 0.199
+相関係数: 実績標準偏差 vs Simple Error = -0.269
+相関係数: 実績CV vs Simple Error = 0.422
+
+観察ポイント
+1. 業務用SKUのSimple Errorは家庭用よりもやや高く、大口顧客特有の変動や補充リードタイムが影響している可能性がある。
+2. ゼロ実績比率が高いSKUほどSimple Errorがわずかに増加しており、間欠需要の対応強化が求められる。
+3. 実績標準偏差が高いSKUではSimple Errorがむしろ低下傾向にある一方、実績CVが高いSKUではSimple Errorが顕著に上昇しており、相対的なばらつきへの対応が必要。

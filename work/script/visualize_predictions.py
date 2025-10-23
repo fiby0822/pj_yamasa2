@@ -13,16 +13,77 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional
+from urllib.request import urlretrieve
 
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import numpy as np
 import pandas as pd
 
 matplotlib.use("Agg")
-plt.rcParams["font.family"] = "DejaVu Sans"
+DEFAULT_INPUT_DIR = Path("/home/ubuntu/yamasa2/input")
+DEFAULT_FONT_URL = (
+    "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Japanese/"
+    "NotoSansCJKjp-Regular.otf"
+)
+DEFAULT_FONT_PATH = Path(__file__).resolve().parent / "tmp" / "fonts" / "NotoSansCJKjp-Regular.otf"
+
+
+def ensure_japanese_font(font_path: Path = DEFAULT_FONT_PATH, font_url: str = DEFAULT_FONT_URL) -> str:
+    """Download and register a Japanese font, returning its family name."""
+
+    font_path.parent.mkdir(parents=True, exist_ok=True)
+    if not font_path.exists():
+        print(f"日本語フォントを取得: {font_path}")
+        urlretrieve(font_url, font_path)
+
+    font_manager.fontManager.addfont(str(font_path))
+    font_name = font_manager.FontProperties(fname=str(font_path)).get_name()
+    plt.rcParams["font.family"] = font_name
+    return font_name
+
+
+@lru_cache(maxsize=1)
+def load_product_name_map(input_dir: Path = DEFAULT_INPUT_DIR) -> Dict[str, str]:
+    """Construct material_code → product_name map from Excel sources."""
+
+    mapping: Dict[str, str] = {}
+    if not input_dir.exists():
+        return mapping
+
+    excel_files = sorted(input_dir.glob("*.xlsx"))
+    for excel_path in excel_files:
+        try:
+            workbook = pd.ExcelFile(excel_path)
+        except Exception as exc:  # pragma: no cover - informational
+            print(f"警告: {excel_path} の読み込みに失敗しました: {exc}")
+            continue
+
+        for sheet in workbook.sheet_names:
+            try:
+                sheet_df = workbook.parse(sheet, usecols=["品番", "品名"])
+            except ValueError:
+                # 必要な列が存在しないシートはスキップ
+                continue
+            except Exception as exc:  # pragma: no cover - informational
+                print(f"警告: {excel_path}::{sheet} の読み込みに失敗しました: {exc}")
+                continue
+
+            if "品番" not in sheet_df.columns or "品名" not in sheet_df.columns:
+                continue
+
+            sheet_df = sheet_df.dropna(subset=["品番", "品名"])
+            sheet_df["品番"] = sheet_df["品番"].astype(str).str.strip()
+            sheet_df["品名"] = sheet_df["品名"].astype(str).str.strip()
+
+            for code, name in sheet_df.drop_duplicates("品番").itertuples(index=False):
+                mapping.setdefault(code, name)
+
+    return mapping
 
 
 class PredictionVisualizer:
@@ -43,6 +104,9 @@ class PredictionVisualizer:
         )
         self.horizon_months = horizon_months
         self.history_months = max(history_months, 0)
+
+        self.font_name = ensure_japanese_font()
+        self.product_name_map = load_product_name_map()
 
         self.graph_dir = self.output_dir / "graph"
         self.summary_dir = self.output_dir / "summary"
@@ -96,12 +160,19 @@ class PredictionVisualizer:
         df["abs_error"] = df["error"].abs()
         denom = np.abs(df["predicted"]) + np.abs(df["actual"]) + 1e-6
         df["smape_pct"] = 200 * df["abs_error"] / denom
-        # 顧客説明用の予測誤差（実績が0の場合は0%）
-        df["simple_error_pct"] = np.where(
-            df["actual"] == 0,
-            0.0,
-            (df["abs_error"] / np.abs(df["actual"])) * 100.0,
-        )
+        # 顧客説明用の予測誤差（予測値を基準に算出）
+        simple_error = pd.Series(np.nan, index=df.index, dtype=float)
+
+        denom_pred = df["predicted"].abs()
+        valid_mask = denom_pred > 0
+        simple_error.loc[valid_mask] = (
+            df.loc[valid_mask, "abs_error"] / denom_pred.loc[valid_mask]
+        ) * 100.0
+
+        actual_zero_mask = df["actual"] == 0
+        simple_error.loc[actual_zero_mask] = 0.0
+
+        df["simple_error_pct"] = simple_error
         df["predict_year_month"] = df["date"].dt.strftime("%Y-%m")
         df["relative_error"] = df["smape_pct"] / 100.0
 
@@ -189,7 +260,7 @@ class PredictionVisualizer:
                     product_hist_df["actual_value"],
                     color="lightgray",
                     linewidth=1.5,
-                    label="Historical Actual (6 months)",
+                    label="過去実績",
                     alpha=0.5,
                 )
 
@@ -200,7 +271,7 @@ class PredictionVisualizer:
             linewidth=2,
             marker="o",
             markersize=5,
-            label="Test Period Actual",
+            label="実績",
             alpha=0.7,
         )
         plt.plot(
@@ -210,18 +281,24 @@ class PredictionVisualizer:
             linewidth=2,
             marker="s",
             markersize=5,
-            label="Predicted",
+            label="予測値",
             alpha=0.7,
         )
 
-        title = f"Product: {product_code} - Actual vs Predicted"
-        valid_errors = product_pred_df["smape_pct"].dropna()
-        if not valid_errors.empty:
-            title += f" (Accuracy: {100 - valid_errors.mean():.1f}%, Err: {product_pred_df['simple_error_pct'].mean():.1f}%)"
+        display_name = self.product_name_map.get(product_code, "")
+        label_core = f"{product_code} {display_name}".strip()
+        if not display_name:
+            label_core = product_code
+
+        simple_error_vals = product_pred_df["simple_error_pct"].dropna()
+        if not simple_error_vals.empty:
+            title = f"{label_core}｜予測 vs 実績｜予測誤差: {simple_error_vals.mean():.1f}%"
+        else:
+            title = f"{label_core}｜予測 vs 実績｜予測誤差: -"
 
         plt.title(title, fontsize=14)
-        plt.xlabel("Date", fontsize=12)
-        plt.ylabel("Demand", fontsize=12)
+        plt.xlabel("日付", fontsize=12)
+        plt.ylabel("出荷数", fontsize=12)
         plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
         plt.legend(loc="upper right")
         plt.tight_layout()
@@ -276,6 +353,16 @@ class PredictionVisualizer:
                     f"sMAPE {row['mape']:.2f}%, SimpleErr {row.get('simple_error', float('nan')):.2f}%, WAPE {row.get('wape', np.nan):.2f}%, "
                     f"MAE {row['mae']:.2f}, RMSE {row['rmse']:.2f}, Samples {row['n_samples']}\n"
                 )
+
+            worst_count = min(10, len(df_summary))
+            if worst_count:
+                f.write("\nBottom 10 products by accuracy:\n")
+                for _, row in df_summary.tail(worst_count).iterrows():
+                    f.write(
+                        f"- {row['material_key']}: Accuracy {row['accuracy']:.2f}%, "
+                        f"sMAPE {row['mape']:.2f}%, SimpleErr {row.get('simple_error', float('nan')):.2f}%, WAPE {row.get('wape', np.nan):.2f}%, "
+                        f"MAE {row['mae']:.2f}, RMSE {row['rmse']:.2f}, Samples {row['n_samples']}\n"
+                    )
 
         print(f"サマリを保存: {summary_csv}, {summary_json}, {summary_txt}")
 
